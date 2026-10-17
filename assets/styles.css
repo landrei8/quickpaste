@@ -859,6 +859,8 @@ body.modal-open { overflow: hidden; }
   margin: 6px 0 0; padding: 8px 12px; border-radius: 10px; background: var(--fill);
   font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere;
 }
+.admin-item-main small.report-note { display: flex; align-items: flex-start; gap: 5px; color: var(--orange); }
+.report-note svg.i, .info-card p svg.i { width: 15px; height: 15px; flex: none; vertical-align: -2px; }
 .admin-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; flex: none; max-width: 52%; }
 .admin-actions .btn.small { padding: 6px 12px; font-size: 13px; gap: 5px; }
 .admin-actions .btn.small svg.i { width: 15px; height: 15px; }

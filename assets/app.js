@@ -299,6 +299,44 @@
     return { auth: toHex(await expand(master, 'auth')), key: await expand(master, 'key') };
   }
 
+  // Reports: the link (and password) are encrypted for every admin's ECDH P-256 public
+  // key. A random key encrypts the payload; it's wrapped for each admin with
+  // ECDH(one-time key, admin key) → HKDF → AES-GCM. AAD binds it to the reported paste.
+  const ECDH = { name: 'ECDH', namedCurve: 'P-256' };
+  async function ecdhWrapKey(privateKey, publicKey, keyId) {
+    const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: publicKey }, privateKey, 256);
+    const master = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveBits']);
+    return aesKey(await expand(master, `quickpaste/v2/report:${keyId}`));
+  }
+  async function sealForAdmins(payload, keys, pasteId) {
+    if (!keys?.length) return null;
+    const contentKey = randomBytes(32);
+    const eph = await crypto.subtle.generateKey(ECDH, false, ['deriveBits']);
+    const wrapped = {};
+    for (const k of keys) {
+      const pub = await crypto.subtle.importKey('spki', fromB64(k.public_key), ECDH, false, []);
+      wrapped[k.key_id] = await seal(await ecdhWrapKey(eph.privateKey, pub, k.key_id), contentKey, `report-key:${pasteId}`);
+    }
+    return {
+      v: 1,
+      eph: toB64(new Uint8Array(await crypto.subtle.exportKey('spki', eph.publicKey))),
+      ct: await sealJson(await aesKey(contentKey), payload, `report:${pasteId}`),
+      keys: wrapped,
+    };
+  }
+  // me: { key_id, privateKey }. Returns the payload, or null if it isn't for this admin.
+  async function openForAdmin(sealed, me, pasteId) {
+    const wrapped = sealed?.keys?.[me.key_id];
+    if (!wrapped) return null;
+    try {
+      const eph = await crypto.subtle.importKey('spki', fromB64(sealed.eph), ECDH, false, []);
+      const contentKey = await unseal(await ecdhWrapKey(me.privateKey, eph, me.key_id), wrapped, `report-key:${pasteId}`);
+      return await unsealJson(await aesKey(contentKey), sealed.ct, `report:${pasteId}`);
+    } catch {
+      return null;
+    }
+  }
+
   const normLink = (s) => String(s || '').trim().toLowerCase();
   const newLink = () => Array.from(randomBytes(ID_LENGTH), (b) => ID_ALPHABET[b % ID_ALPHABET.length]).join('');
   function linkProblem(link) {
@@ -389,7 +427,7 @@
     if (/rate limit/i.test(message)) return 'Too many attempts. Please wait a moment and try again.';
     if (/could not find the function/i.test(message)) return 'The database needs updating — run supabase/schema.sql again';
     if (/exceeded the maximum allowed size|payload too large|entity too large/i.test(message)) return 'That file is too large';
-    if (/row-level security|violates.*policy|unauthorized/i.test(message)) return 'Upload refused — you may be out of storage space';
+    if (/row-level security|violates.*policy|unauthorized/i.test(message)) return 'Upload refused by the server — please try again';
     if (/bucket not found/i.test(message)) return 'File storage isn’t set up — run supabase/schema.sql again';
     return message || 'Something went wrong';
   }
@@ -426,8 +464,9 @@
       get: (id, auth) => rpc('get_paste', { p_id: id, p_auth: auth || null }),
       linkAvailable: (id) => rpc('link_available', { p_id: id }),
       recent: () => rpc('recent_pastes', { p_limit: 30 }),
+      reportKeys: () => rpc('report_keys'),
       report: (r) => rpc('report_paste', {
-        p_id: r.id, p_link: r.link, p_password: r.password || null, p_reason: r.reason, p_details: r.details || null,
+        p_id: r.id, p_sealed: r.sealed || null, p_reason: r.reason, p_details: r.details || null,
       }),
       siteSettings: () => rpc('site_settings'),
       myAccount: () => rpc('my_account'),
@@ -456,9 +495,11 @@
           const { error } = await client.storage.from(bucket).remove(paths);
           if (error) throw new Error(friendlyError(error.message));
         },
-        register: (id, encMeta, note, expiresIn) => rpc('register_file', {
-          p_id: id, p_enc_meta: encMeta, p_owner_note: note, p_expires_in: expiresIn,
+        reserve: (id, size, encMeta, note, expiresIn) => rpc('reserve_file', {
+          p_id: id, p_size: size, p_enc_meta: encMeta, p_owner_note: note, p_expires_in: expiresIn,
         }),
+        finish: (id) => rpc('finish_file', { p_id: id }),
+        cancel: (id) => rpc('cancel_file', { p_id: id }),
         get: (id) => rpc('get_file', { p_id: id }),
         expiredGuest: () => rpc('expired_guest_files', { p_limit: 50 }),
         purgeGuestRows: () => rpc('purge_expired_guest_rows'),
@@ -478,6 +519,10 @@
         setGuestTtl: (minutes) => rpc('admin_set_guest_ttl', { p_minutes: minutes }),
         reports: (status) => rpc('admin_reports', { p_status: status }),
         setReportStatus: (id, status) => rpc('admin_set_report_status', { p_id: id, p_status: status }),
+        myKey: () => rpc('admin_my_key'),
+        setKey: (k) => rpc('admin_set_key', { p_key_id: k.key_id, p_public_key: k.public_key, p_wrapped_private: k.wrapped_private }),
+        sealReport: (id, sealed) => rpc('admin_seal_report', { p_id: id, p_sealed: sealed }),
+
         pastes: (query) => rpc('admin_pastes', { p_query: query || null, p_limit: 200, p_offset: 0 }),
         getPaste: (id) => rpc('admin_get_paste', { p_id: id }),
         setVisibility: (id, visibility) => rpc('admin_set_visibility', { p_id: id, p_visibility: visibility }),
@@ -539,6 +584,7 @@
       admins: 'quickpaste:demo3-admins', settings: 'quickpaste:demo3-settings', limits: 'quickpaste:demo3-limits',
       vaults: 'quickpaste:demo3-vaults', reports: 'quickpaste:demo3-reports',
       files: 'quickpaste:demo3-files', objects: 'quickpaste:demo3-objects',
+      adminKeys: 'quickpaste:demo3-admin-keys', rates: 'quickpaste:demo3-rates',
     };
     // File bytes live in IndexedDB (too big for localStorage); object metadata in localStorage.
     const blobs = (() => {
@@ -584,10 +630,42 @@
     const storageQuota = (id) => (read(K.limits, {})[id]?.storage
       ?? (read(K.admins, []).includes(id) ? settings().admin_storage_quota_mb : settings().storage_quota_mb)) * MB;
     const objects = () => read(K.objects, {});
-    const storageUsed = (id) => Object.entries(objects())
-      .filter(([key]) => key.startsWith(`files/${id}/`)).reduce((sum, [, o]) => sum + o.size, 0);
-    const guestPoolUsed = () => Object.entries(objects())
-      .filter(([key]) => key.startsWith('guest-files/')).reduce((sum, [, o]) => sum + o.size, 0);
+    // Mirrors qp_bytes_used(): each row counts max(reserved, stored), plus bytes without a row.
+    const bytesUsed = (bucket, owner) => {
+      const objs = objects();
+      const rows = Object.values(read(K.files, {})).filter((f) => f.bucket === bucket && (f.owner_id || null) === owner);
+      const hourAgo = Date.now() - 3600000;
+      const fromRows = rows.reduce((sum, f) => {
+        const o = objs[`${bucket}/${f.object_path}`];
+        if (f.pending && !o && new Date(f.created_at).getTime() < hourAgo) return sum;
+        return sum + Math.max(f.size, o?.size || 0);
+      }, 0);
+      const folder = `${bucket}/${owner || 'guest'}/`;
+      const orphans = Object.entries(objs)
+        .filter(([key]) => key.startsWith(folder) && !rows.some((f) => `${bucket}/${f.object_path}` === key))
+        .reduce((sum, [, o]) => sum + o.size, 0);
+      return fromRows + orphans;
+    };
+    const storageUsed = (id) => bytesUsed('files', id);
+    const guestPoolUsed = () => bytesUsed('guest-files', null);
+    // Mirrors the rate limits in schema.sql (this browser is the only client).
+    const rateHits = (action, subject, secs) => {
+      const r = read(K.rates, {})[`${action}:${subject}`];
+      return r && r.start > Date.now() - secs * 1000 ? r.hits : 0;
+    };
+    const rateHit = (action, subject, secs) => {
+      const rates = read(K.rates, {});
+      const key = `${action}:${subject}`;
+      const r = rates[key] && rates[key].start > Date.now() - secs * 1000 ? rates[key] : { start: Date.now(), hits: 0 };
+      r.hits += 1;
+      rates[key] = r;
+      write(K.rates, rates);
+      return r.hits;
+    };
+    const rateLimit = (action, max, secs) => {
+      if (rateHits(action, 'me', secs) >= max) throw new Error(friendlyError('Rate limit reached'));
+      rateHit(action, 'me', secs);
+    };
     const setLimit = (id, field, value) => {
       const limits = read(K.limits, {});
       limits[id] = { ...limits[id], [field]: value };
@@ -601,7 +679,8 @@
     // Mirrors qp_guest_object_removable(): expired, or abandoned for over an hour.
     const guestRemovable = (path) => {
       const f = Object.values(read(K.files, {})).find((x) => x.bucket === 'guest-files' && x.object_path === path);
-      if (f) return isExpired(f);
+      if (f && isExpired(f)) return true;
+      if (f && !f.pending) return false;
       const o = objects()[`guest-files/${path}`];
       return !!o && new Date(o.created_at).getTime() < Date.now() - 3600000;
     };
@@ -625,9 +704,11 @@
 
     return {
       async create(b) {
+        rateLimit('create', 30, 600);
         checkInput(b);
         if (!LOOKUP_RE.test(b.id)) throw new Error('Invalid paste id');
         if (b.content != null && (b.visibility !== 'public' || b.auth)) throw new Error('Only public pastes without a password can be stored unencrypted');
+        if (b.visibility === 'public' && b.auth) throw new Error('Pastes with a password can’t be public — choose Unlisted');
         if (b.visibility === 'public' ? !LINK_RE.test(b.publicSlug || '') : b.publicSlug) throw new Error('Invalid link');
         if (b.visibility === 'private' && !uid()) throw new Error('Sign in to create private pastes');
         const all = read(K.pastes, {});
@@ -653,10 +734,17 @@
       async get(id, auth) {
         const all = read(K.pastes, {});
         const p = all[id];
-        if (!p) return null;
+        if (!p) {
+          if (rateHit('miss', 'me', 600) > 120) throw new Error(friendlyError('Rate limit reached'));
+          return null;
+        }
         if (p.owner_id && p.owner_id === uid()) return toJson(p);
         if (p.visibility === 'private' || isExpired(p)) return null;
+        if (p.password_hash && auth && (rateHits('password', 'me', 600) >= 10 || rateHits('password-paste', id, 3600) >= 30)) {
+          throw new Error('Too many wrong passwords. Wait a few minutes and try again.');
+        }
         if (p.password_hash && (!auth || (await hash(auth)) !== p.password_hash)) {
+          if (auth) { rateHit('password', 'me', 600); rateHit('password-paste', id, 3600); }
           return { id, locked: true, wrong_password: !!auth, enc_salt: p.enc_salt, encrypted: p.enc != null };
         }
         if (p.burn_after_read) delete all[id]; else p.views += 1;
@@ -664,11 +752,13 @@
         return toJson(p);
       },
       async linkAvailable(id) {
+        rateLimit('check', 120, 600);
         return !read(K.pastes, {})[id];
       },
       async recent() {
         return Object.values(read(K.pastes, {}))
-          .filter((p) => !isExpired(p) && p.visibility === 'public' && !p.burn_after_read)
+          .filter((p) => !isExpired(p) && p.visibility === 'public' && !p.burn_after_read
+            && (p.public_slug || !LOOKUP_RE.test(p.id)))
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
           .slice(0, 30)
           .map((p) => ({
@@ -677,12 +767,19 @@
             preview: p.password_hash || p.enc ? null : p.content.slice(0, 400),
           }));
       },
+      async reportKeys() {
+        const admins = read(K.admins, []);
+        return Object.entries(read(K.adminKeys, {}))
+          .filter(([id]) => admins.includes(id)).map(([, k]) => ({ key_id: k.key_id, public_key: k.public_key }));
+      },
       async report(r) {
+        rateLimit('report', 5, 600);
         if (!REASON_NAME[r.reason]) throw new Error('Choose a reason');
         const reports = read(K.reports, []);
         const exists = !!read(K.pastes, {})[r.id];
         reports.push({
-          id: (reports.at(-1)?.id || 0) + 1, paste_id: exists ? r.id : null, link: r.link, password: r.password || null,
+          id: (reports.at(-1)?.id || 0) + 1, paste_id: exists ? r.id : null, sealed: exists ? r.sealed || null : null,
+          link: null, password: null,
           reason: r.reason, details: r.details || null, reporter_id: uid(), status: 'open',
           created_at: new Date().toISOString(), resolved_at: null,
         });
@@ -735,6 +832,8 @@
         if (b.passwordMode === 'set' && !b.auth) throw new Error('Enter a new password');
         const finalPw = b.passwordMode === 'set' ? true : b.passwordMode === 'remove' ? false : !!rec.password_hash;
         if (b.content != null && (b.visibility !== 'public' || finalPw)) throw new Error('Only public pastes without a password can be stored unencrypted');
+        if (b.visibility === 'public' && finalPw && LOOKUP_RE.test(b.id)) throw new Error('Pastes with a password can’t be public — choose Unlisted');
+
         if (b.visibility === 'public' && !LINK_RE.test(b.publicSlug || '')) throw new Error('Invalid link');
         Object.assign(rec, {
           public_slug: b.visibility === 'public' ? b.publicSlug : null,
@@ -763,13 +862,10 @@
         async upload(bucket, path, blob) {
           const max = bucket === 'files' ? USER_FILE_MAX : GUEST_FILE_MAX;
           if (blob.size > max) throw new Error('That file is too large');
-          const folder = path.split('/')[0];
-          if (bucket === 'files' && (!uid() || folder !== uid() || storageUsed(uid()) >= storageQuota(uid()))) {
-            throw new Error('Upload refused — you may be out of storage space');
-          }
-          if (bucket === 'guest-files' && (folder !== 'guest' || guestPoolUsed() >= settings().guest_pool_mb * MB)) {
-            throw new Error('Guest storage is full right now — sign in to upload');
-          }
+          // Mirrors qp_upload_allowed(): only a fresh reservation of this exact path and size.
+          const reserved = Object.values(read(K.files, {})).find((f) => f.bucket === bucket && f.object_path === path
+            && f.pending && (f.owner_id || null) === uid() && new Date(f.created_at).getTime() > Date.now() - 3600000);
+          if (!reserved || blob.size > reserved.size) throw new Error(friendlyError('new row violates row-level security policy'));
           const key = `${bucket}/${path}`;
           const all = objects();
           if (all[key]) throw new Error('That file already exists');
@@ -806,27 +902,54 @@
           write(K.files, all);
           return n;
         },
-        async register(id, encMeta, note, expiresIn) {
+        // Mirrors reserve_file(), finish_file() and cancel_file().
+        async reserve(id, size, encMeta, note, expiresIn) {
           if (!LOOKUP_RE.test(id)) throw new Error('Invalid file id');
+          if (uid()) rateLimit('upload', 100, 3600); else rateLimit('upload-guest', 20, 3600);
           if (!uid()) expiresIn = settings().guest_file_ttl_minutes * 60; // guests don't choose
           const bucket = uid() ? 'files' : 'guest-files';
-          const path = uid() ? `${uid()}/${id}` : `guest/${id}`;
-          const object = objects()[`${bucket}/${path}`];
-          if (!object) throw new Error('Upload the file first');
+          if (!(size >= 1 && size <= (uid() ? USER_FILE_MAX : GUEST_FILE_MAX))) throw new Error('That file is too large');
+          const quota = uid() ? storageQuota(uid()) : settings().guest_pool_mb * MB;
+          if (bytesUsed(bucket, uid()) + size > quota) {
+            throw new Error(uid() ? 'Not enough storage space for this file' : 'Guest storage is full right now. Sign in to upload.');
+          }
           const all = read(K.files, {});
-          if (all[id]) throw new Error('That file is already registered');
+          if (all[id]) throw new Error('That file already exists');
           all[id] = {
-            id, owner_id: uid(), bucket, object_path: path, enc_meta: encMeta, owner_note: uid() ? note : null,
-            size: object.size, shared: !uid(), downloads: 0, created_at: new Date().toISOString(),
-            updated_at: null, expires_at: expiry(expiresIn),
+            id, owner_id: uid(), bucket, object_path: uid() ? `${uid()}/${id}` : `guest/${id}`, enc_meta: encMeta,
+            owner_note: uid() ? note : null, size, shared: !uid(), downloads: 0, created_at: new Date().toISOString(),
+            updated_at: null, expires_at: expiry(expiresIn), pending: true,
           };
           write(K.files, all);
           return fileJson(all[id]);
         },
+        async finish(id) {
+          const all = read(K.files, {});
+          const f = all[id];
+          if (!f || !f.pending || (f.owner_id || null) !== uid()) throw new Error('Upload not found');
+          const object = objects()[`${f.bucket}/${f.object_path}`];
+          if (!object) throw new Error('Upload the file first');
+          if (object.size > f.size) {
+            Object.assign(f, { size: object.size, pending: false, shared: false, expires_at: new Date().toISOString() });
+            write(K.files, all);
+            return null;
+          }
+          Object.assign(f, { size: object.size, pending: false, created_at: new Date().toISOString() });
+          write(K.files, all);
+          return fileJson(f);
+        },
+        async cancel(id) {
+          const all = read(K.files, {});
+          const f = all[id];
+          if (!f || !f.pending || (f.owner_id || null) !== uid() || objects()[`${f.bucket}/${f.object_path}`]) return false;
+          delete all[id];
+          write(K.files, all);
+          return true;
+        },
         async get(id) {
           const all = read(K.files, {});
           const f = all[id];
-          if (!f) return null;
+          if (!f || f.pending) return null;
           if (f.owner_id && f.owner_id === uid()) return fileJson(f);
           if (!f.shared || isExpired(f)) return null;
           f.downloads += 1;
@@ -836,7 +959,7 @@
         async mine() {
           if (!user) return null;
           const files = Object.values(read(K.files, {}))
-            .filter((f) => f.owner_id === uid())
+            .filter((f) => f.owner_id === uid() && !f.pending)
             .sort((a, b) => b.created_at.localeCompare(a.created_at))
             .map((f) => ({ ...fileJson(f), owner_note: f.owner_note }));
           return { used: storageUsed(uid()), quota: storageQuota(uid()), files };
@@ -844,8 +967,9 @@
         async setShared(id, shared) {
           const all = read(K.files, {});
           const f = all[id];
-          if (!f || f.owner_id !== uid()) throw new Error('File not found');
+          if (!f || f.owner_id !== uid() || f.pending) throw new Error('File not found');
           f.shared = !!shared;
+
           write(K.files, all);
           return fileJson(f);
         },
@@ -862,7 +986,7 @@
         async overview() {
           requireAdmin();
           const pastes = Object.values(read(K.pastes, {}));
-          const files = Object.values(read(K.files, {}));
+          const files = Object.values(read(K.files, {})).filter((f) => !f.pending);
           const s = settings();
           return {
             pastes: pastes.length, encrypted: pastes.filter((p) => p.enc).length,
@@ -871,13 +995,14 @@
             files: files.length, storage_bytes: files.reduce((sum, f) => sum + f.size, 0),
             guest_pool_used: guestPoolUsed(), default_limit: s.custom_link_limit, guest_file_ttl_minutes: s.guest_file_ttl_minutes,
             storage_quota_mb: s.storage_quota_mb, admin_storage_quota_mb: s.admin_storage_quota_mb, guest_pool_mb: s.guest_pool_mb,
+            rate_limit_active: true,
           };
         },
         async files(query) {
           requireAdmin();
           const q = (query || '').trim().toLowerCase();
           const users = usersById();
-          return Object.values(read(K.files, {}))
+          return Object.values(read(K.files, {})).filter((f) => !f.pending)
             .map((f) => ({ ...fileJson(f), owner_email: users[f.owner_id]?.email || null }))
             .filter((f) => !q || f.id === q || (f.owner_email || '').toLowerCase().includes(q))
             .sort((a, b) => b.created_at.localeCompare(a.created_at));
@@ -896,7 +1021,7 @@
           const hourAgo = Date.now() - 3600000;
           const orphans = Object.entries(objects())
             .filter(([key, o]) => new Date(o.created_at).getTime() < hourAgo
-              && !files.some((f) => `${f.bucket}/${f.object_path}` === key))
+              && !files.some((f) => !f.pending && `${f.bucket}/${f.object_path}` === key))
             .map(([key]) => ({ bucket: key.split('/')[0], path: key.split('/').slice(1).join('/'), file_id: null }));
           return [...expired, ...orphans];
         },
@@ -939,6 +1064,22 @@
           const reports = read(K.reports, []);
           const r = reports.find((x) => x.id === id);
           if (r) { r.status = status; r.resolved_at = status === 'open' ? null : new Date().toISOString(); }
+          if (r && status !== 'open') Object.assign(r, { sealed: null, link: null, password: null }); // closed: keep no link
+          write(K.reports, reports);
+        },
+        async myKey() {
+          requireAdmin();
+          return read(K.adminKeys, {})[uid()] || null;
+        },
+        async setKey(k) {
+          requireAdmin();
+          write(K.adminKeys, { ...read(K.adminKeys, {}), [uid()]: { key_id: k.key_id, public_key: k.public_key, wrapped_private: k.wrapped_private } });
+        },
+        async sealReport(id, sealed) {
+          requireAdmin();
+          const reports = read(K.reports, []);
+          const r = reports.find((x) => x.id === id && x.status === 'open');
+          if (r) Object.assign(r, { sealed, link: null, password: null });
           write(K.reports, reports);
         },
         async pastes(query) {
@@ -981,7 +1122,8 @@
           delete all[id];
           write(K.pastes, all);
           const reports = read(K.reports, []);
-          reports.forEach((r) => { if (r.paste_id === id) r.paste_id = null; });
+          reports.forEach((r) => { if (r.paste_id === id) Object.assign(r, { paste_id: null, sealed: null, link: null, password: null }); });
+
           write(K.reports, reports);
           return true;
         },
@@ -1074,6 +1216,7 @@
   let site = { guest_file_ttl_minutes: 60 }; // public settings, loaded at startup
   let account = null;   // { is_admin, custom_used, custom_limit, has_vault }
   let vaultKey = null;  // AES key that encrypts this user's list of links (owner_note)
+  let adminKey = null;  // admins: { key_id, privateKey } for reading reports
   let booted = false;
   // Pastes opened this session, by link — lets a creator view a burn-after-read
   // paste without destroying it, and avoids re-fetching on back/forward.
@@ -1088,6 +1231,7 @@
       cache.clear();
       if (previous) storage.del(vaultSlot(previous.id));
       vaultKey = null;
+      adminKey = null;
       account = null;
       if (user) {
         await restoreVault(user.id);
@@ -1101,6 +1245,8 @@
   async function refreshAccount() {
     account = currentUser ? await api.myAccount().catch(() => null) : null;
     renderAccount();
+    if (account?.is_admin) ensureAdminKey().catch(() => {}); // so reports can be encrypted for this admin
+
   }
 
   // ───────── Vault: the user's links, encrypted with a key only they can unwrap ─────────
@@ -1136,9 +1282,34 @@
     }
     storage.set(vaultSlot(uid), toB64(raw));
     vaultKey = await aesKey(raw);
+    if (account?.is_admin) ensureAdminKey().catch(() => {});
+
   }
 
-  const sealNote = async (note) => (currentUser && vaultKey ? sealJson(vaultKey, note, `note:${currentUser.id}`) : null);
+  // Admins: load (or create) the key pair that reports are encrypted for. The
+  // private half is stored encrypted with the vault key, so it needs the vault.
+  async function ensureAdminKey() {
+    if (adminKey || !hasCrypto || !vaultKey || !account?.is_admin) return adminKey;
+    const aad = `admin-key:${currentUser.id}`;
+    const mine = await api.admin.myKey();
+    if (mine) {
+      try {
+        const pkcs8 = await unseal(vaultKey, mine.wrapped_private, aad);
+        adminKey = { key_id: mine.key_id, privateKey: await crypto.subtle.importKey('pkcs8', pkcs8, ECDH, false, ['deriveBits']) };
+        return adminKey;
+      } catch { /* the vault was recreated (password reset): make a new key pair below */ }
+    }
+    const pair = await crypto.subtle.generateKey(ECDH, true, ['deriveBits']);
+    const spki = new Uint8Array(await crypto.subtle.exportKey('spki', pair.publicKey));
+    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+    const keyId = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', spki))).slice(0, 32);
+    await api.admin.setKey({ key_id: keyId, public_key: toB64(spki), wrapped_private: await seal(vaultKey, pkcs8, aad) });
+    adminKey = { key_id: keyId, privateKey: await crypto.subtle.importKey('pkcs8', pkcs8, ECDH, false, ['deriveBits']) };
+    return adminKey;
+  }
+
+  const sealNote = async (note) =>
+ (currentUser && vaultKey ? sealJson(vaultKey, note, `note:${currentUser.id}`) : null);
   async function openNote(blob) {
     if (!blob || !vaultKey || !currentUser) return null;
     try { return await unsealJson(vaultKey, blob, `note:${currentUser.id}`); } catch { return null; }
@@ -1340,16 +1511,17 @@
     const meta = { name: file.name, type: file.type || 'application/octet-stream', size: file.size };
     const encMeta = await sealJson(aes, meta, `${lookup}:meta`);
     const note = guest ? null : await sealNote({ link, ...meta });
-    const bucket = guest ? 'guest-files' : 'files';
-    const path = guest ? `guest/${lookup}` : `${currentUser.id}/${lookup}`;
-    await api.files.upload(bucket, path, blob);
+    // Reserve the space first (checked atomically by the server), then upload exactly that, then confirm.
+    const reserved = await api.files.reserve(lookup, blob.size, encMeta, note, expiresIn);
     try {
-      const row = await api.files.register(lookup, encMeta, note, expiresIn);
-      return { ...row, link, meta };
+      await api.files.upload(reserved.bucket, reserved.object_path, blob);
     } catch (err) {
-      if (!guest) await api.files.removeObjects(bucket, [path]).catch(() => {});
+      await api.files.cancel(lookup).catch(() => {});
       throw err;
     }
+    const row = await api.files.finish(lookup);
+    if (!row) throw new Error('The upload didn’t match its reservation — please try again');
+    return { ...row, link, meta };
   }
 
   // Open a file by link: returns its row plus decrypted name/type, or null.
@@ -1656,15 +1828,16 @@
         text = 'This paste was created before encryption, so it’s stored unencrypted. Duplicate it to get an encrypted copy with a new link.';
       } else if (visibility === 'public' && !hasPw) {
         kind = 'open';
-        text = 'Public pastes are listed in Recent and stored unencrypted, so anyone (including site admins) can read them.';
+        text = 'Public pastes are listed in Recent and stored unencrypted with their link, so anyone (including site admins) can read them.';
       } else if (visibility === 'public') {
-        text = 'Listed in Recent, but the content is end-to-end encrypted with the password.';
+        text = 'Pastes with a password aren’t listed in Recent, so their link stays secret. It will be saved as Unlisted: end-to-end encrypted with the link and the password.';
       } else if (visibility === 'private') {
         text = 'End-to-end encrypted, and only you can open it.';
       } else {
         text = 'End-to-end encrypted. Only people with the link can read it — not even the site admins.';
       }
-      if (editing && !legacy && existing.visibility === 'public' && visibility !== 'public') {
+      if (editing && !legacy && existing.visibility === 'public' && (visibility !== 'public' || hasPw)) {
+
         text += ' This link was public before, so it may already be known — duplicate it for a fresh link.';
       }
       encStatus.className = `enc-status ${kind}`;
@@ -1895,8 +2068,11 @@
       const lang = language.value === 'auto' ? detectLanguage(content) : language.value;
       const keepExpiry = expires.value === 'keep';
       const expiresIn = expires.value && !keepExpiry ? Number(expires.value) : null;
+      // A password paste is never listed: its link would have to be stored on the server.
+      const hasPw = !removePassword && (!!password.value || (editing && existing.has_password));
+      const finalVisibility = visibility === 'public' && hasPw && !legacy ? 'unlisted' : visibility;
       const input = {
-        title: title.value.trim(), content, language: lang, visibility, expiresIn,
+        title: title.value.trim(), content, language: lang, visibility: finalVisibility, expiresIn,
         burn: burn.checked, password: password.value,
       };
 
@@ -1912,7 +2088,8 @@
         } else {
           const { link, body } = await createPaste({ ...input, customLink: linkState.value || null });
           cache.set(link, {
-            id: link, link, rowId: body.id, title: input.title, content, language: lang, visibility,
+            id: link, link, rowId: body.id, title: input.title, content, language: lang, visibility: finalVisibility,
+
             burn_after_read: input.burn, has_password: !!input.password, password: input.password || null,
             encrypted: !!body.enc, views: 0, own: true, is_owner: !!currentUser, is_custom: !!linkState.value,
             created_at: new Date().toISOString(),
@@ -2079,10 +2256,10 @@
       <form class="report-form" novalidate>
         <div class="dialog-icon">${icon('flag')}</div>
         <h2>Report this paste</h2>
-        <p>Reporting shares this paste’s link with the site admins so they can decrypt and review it. Nobody else sees your report.</p>
+        <p>Your report includes this paste’s link, encrypted in your browser so only the site admins can open it. It’s deleted once the report is handled.</p>
         <fieldset class="choices">${reasons}</fieldset>
         <textarea name="details" rows="3" maxlength="1000" placeholder="Anything else admins should know? (optional)"></textarea>
-        ${p.has_password ? '<label class="check"><input type="checkbox" name="includePassword" checked><span>Include the password so admins can read it</span></label>' : ''}
+        ${p.has_password ? '<label class="check"><input type="checkbox" name="includePassword"><span>Include the password so admins can read it (also encrypted)</span></label>' : ''}
         <div class="dialog-actions">
           <button class="btn" type="button" data-v="0">Cancel</button>
           <button class="btn destructive" type="submit"><span class="label">Report</span><span class="spinner"></span></button>
@@ -2097,10 +2274,13 @@
       btn.disabled = true;
       btn.classList.add('loading');
       try {
+        const keys = hasCrypto ? await api.reportKeys() : [];
+        const secret = { link: p.link, password: form.elements.includePassword?.checked ? p.password : null };
         await api.report({
-          id: p.rowId, link: p.link, reason: form.elements.reason.value, details: form.elements.details.value,
-          password: form.elements.includePassword?.checked ? p.password : null,
+          id: p.rowId, sealed: await sealForAdmins(secret, keys, p.rowId),
+          reason: form.elements.reason.value, details: form.elements.details.value,
         });
+
         close(true);
         toast('Thanks — the admins will take a look');
       } catch (err) {
@@ -2141,11 +2321,12 @@
 
   // ───────── View: my pastes ─────────
 
-  function viewUnlockVault(next = async () => viewMine(await loadMine())) {
+  function viewUnlockVault(next = async () => viewMine(await loadMine()), copy = {}) {
     return viewPasswordPrompt({
       glyph: 'unlock',
-      heading: 'Unlock your pastes',
-      text: 'Your links are encrypted with your account password, so even we can’t see them. Enter it to unlock them on this device.',
+      heading: copy.heading || 'Unlock your pastes',
+      text: copy.text || 'Your links are encrypted with your account password, so even we can’t see them. Enter it to unlock them on this device.',
+
       label: 'Unlock',
       autocomplete: 'current-password',
       async onSubmit(pw) {
@@ -2547,6 +2728,7 @@
         list.innerHTML = `<li class="admin-empty">${icon('check')}<span>${status === 'open' ? 'No open reports. All clear!' : 'No reports yet.'}</span></li>`;
         return;
       }
+      await decryptReports(reports);
       list.innerHTML = reports.map((r) => {
         const what = !r.paste_exists ? 'Paste no longer exists' : r.title || (r.encrypted ? 'Encrypted paste' : 'Untitled');
         const who = [`Reported ${relativeTime(r.created_at)}`, r.reporter_email ? `by ${r.reporter_email}` : 'anonymously'];
@@ -2562,7 +2744,10 @@
                 ${r.encrypted ? `<span class="pill green">${icon('shield')}Encrypted</span>` : ''}
               </span>
               <strong>${esc(what)}</strong>
-              <small>${esc(who.join(' · '))}${r.link ? ` · <code>#/${esc(r.link)}</code>` : ''}</small>
+              <small>${esc(who.join(' · '))}${r.secret?.link ? ` · <code>#/${esc(r.secret.link)}</code>` : ''}</small>
+              ${r.status === 'open' && r.paste_exists && !r.secret ? `<small class="report-note">${icon('lock')}${esc(
+                r.sealed ? 'The link is encrypted for another admin’s key. It becomes readable here once that admin opens the dashboard.'
+                  : 'This report has no link, so an encrypted paste can’t be read.')}</small>` : ''}
               ${r.details ? `<p class="report-details">${esc(r.details)}</p>` : ''}
             </div>
             <div class="admin-actions">
@@ -2584,7 +2769,7 @@
       const r = reports.find((x) => String(x.id) === btn.closest('.admin-item').dataset.id);
       const act = btn.dataset.act;
       const done = () => { load(); ctx.refreshStats(); };
-      if (act === 'review') return reviewPaste(r.paste_id, { link: r.link, password: r.password, onChange: done });
+      if (act === 'review') return reviewPaste(r.paste_id, { link: r.secret?.link, password: r.secret?.password, onChange: done });
       let ok = false;
       if (act === 'hide') ok = await adminAction(() => api.admin.setVisibility(r.paste_id, 'private'), 'Paste is now private');
       if (act === 'delete') {
@@ -2611,6 +2796,24 @@
       load();
     });
     load();
+  }
+
+  // Decrypt each report's link with this admin's key. Reports from older versions
+  // (plain-text link) and reports sealed before another admin joined are re-encrypted
+  // for every current admin key, which also wipes the plain text from the database.
+  async function decryptReports(reports) {
+    const me = await ensureAdminKey().catch(() => null);
+    const keys = me ? await api.reportKeys().catch(() => []) : [];
+    for (const r of reports) {
+      r.secret = (me && r.sealed ? await openForAdmin(r.sealed, me, r.paste_id) : null)
+        || (r.link ? { link: r.link, password: r.password || null } : null);
+      const missingKey = keys.some((k) => !r.sealed?.keys?.[k.key_id]);
+      if (r.secret && r.status === 'open' && r.paste_id && keys.length && (r.link || r.password || missingKey)) {
+        sealForAdmins(r.secret, keys, r.paste_id)
+          .then((sealed) => api.admin.sealReport(r.id, sealed))
+          .catch(() => { /* try again next time */ });
+      }
+    }
   }
 
   // Admin review: plain pastes show directly; encrypted ones only with the link (and password) from a report.
@@ -2987,8 +3190,15 @@
         <p>To make someone an admin, run this in the Supabase SQL Editor:</p>
         <pre><code>insert into public.admins (user_id)
 select id from auth.users where email = 'them@example.com';</code></pre>
-        <p>Admins can’t read encrypted pastes unless someone reports one with its link.</p>
+        <p>Admins can’t read encrypted pastes unless someone reports one with its link. Reported links are encrypted for each admin’s key, which is created the first time that admin unlocks their account, so a new admin can read older reports once an existing admin opens the dashboard.</p>
+      </div>
+      <h2 class="section-label">Rate limiting</h2>
+      <div class="group card info-card">
+        <p>${ctx.stats.rate_limit_active
+          ? `${icon('check')} Active. Visitors are limited per IP address (stored only as a salted hash): wrong paste passwords, new pastes, reports, uploads and lookups of links that don’t exist.`
+          : `${icon('warn')} Limited. The server couldn’t see visitors’ IP addresses, so only the per-paste password limit applies.`}</p>
       </div>`;
+
     const ttlPicker = $('.guest-ttl-picker', panel);
     ttlPicker.addEventListener('click', async (e) => {
       const b = e.target.closest('[data-ttl]');
@@ -3353,7 +3563,12 @@ select id from auth.users where email = 'them@example.com';</code></pre>
       } else if (route.name === 'admin') {
         if (!currentUser) page = viewAuth({ returnTo: location.hash, note: 'Sign in with an admin account.' });
         else if (!account?.is_admin) page = emptyState('lock', 'Admins only', 'Your account doesn’t have access to the admin dashboard.', true);
-        else page = viewAdmin(route.tab, await api.admin.overview());
+        else if (hasCrypto && !vaultKey) {
+          page = viewUnlockVault(async () => viewAdmin(route.tab, await api.admin.overview()), {
+            heading: 'Unlock the dashboard',
+            text: 'Reports are encrypted for your admin key, which is protected by your account password. Enter it to unlock them on this device.',
+          });
+        } else page = viewAdmin(route.tab, await api.admin.overview());
       } else {
         if (currentUser) await refreshAccount();
         page = viewComposer();
