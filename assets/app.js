@@ -28,6 +28,16 @@
   const LOOKUP_RE = /^[0-9a-f]{64}$/;
   const hasCrypto = !!(window.crypto && crypto.subtle);
 
+  // Files: limits match the Storage bucket limits in supabase/schema.sql.
+  const MB = 1024 * 1024;
+  const USER_FILE_MAX = 25 * MB;
+  const GUEST_FILE_MAX = 5 * MB;
+  const GCM_OVERHEAD = 28; // 12-byte IV + 16-byte tag added to every encrypted file
+  const FILE_EXPIRATIONS = {
+    user: [['', 'Never'], ['3600', '1 Hour'], ['86400', '1 Day'], ['604800', '1 Week'], ['2592000', '1 Month']],
+    guest: [['3600', '1 Hour'], ['86400', '1 Day'], ['604800', '1 Week']],
+  };
+
   const LANGUAGES = [
     ['auto', 'Auto-detect'], ['plaintext', 'Plain Text'], ['bash', 'Bash'], ['c', 'C'],
     ['cpp', 'C++'], ['csharp', 'C#'], ['css', 'CSS'], ['diff', 'Diff'], ['go', 'Go'],
@@ -109,6 +119,8 @@
     users: '<circle cx="9" cy="8.5" r="3.3"/><path d="M3 19.5c.6-3.2 3-5 6-5s5.4 1.8 6 5"/><path d="M15.5 5.6a3.3 3.3 0 0 1 0 5.8M17.5 14.7c1.8.6 3 2.3 3.5 4.8"/>',
     flag: '<path d="M5.5 21V4.5M5.5 4.5h11l-2 4 2 4h-11"/>',
     gauge: '<path d="M4.5 17.5a8.5 8.5 0 1 1 15 0"/><path d="m12 13 3.5-4"/>',
+    upload: '<path d="M12 15.5V4M7.5 8.5 12 4l4.5 4.5M5 19.5h14"/>',
+    folder: '<path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
   };
   const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -374,6 +386,9 @@
     if (/already registered|already exists/i.test(message)) return 'An account with this email already exists';
     if (/rate limit/i.test(message)) return 'Too many attempts. Please wait a moment and try again.';
     if (/could not find the function/i.test(message)) return 'The database needs updating — run supabase/schema.sql again';
+    if (/exceeded the maximum allowed size|payload too large|entity too large/i.test(message)) return 'That file is too large';
+    if (/row-level security|violates.*policy|unauthorized/i.test(message)) return 'Upload refused — you may be out of storage space';
+    if (/bucket not found/i.test(message)) return 'File storage isn’t set up — run supabase/schema.sql again';
     return message || 'Something went wrong';
   }
 
@@ -423,8 +438,38 @@
       }),
       remove: (id) => rpc('delete_paste', { p_id: id }),
 
+      files: {
+        async upload(bucket, path, blob) {
+          const { error } = await client.storage.from(bucket).upload(path, blob, { contentType: 'application/octet-stream', upsert: false });
+          if (error) throw new Error(friendlyError(error.message));
+        },
+        async download(bucket, path) {
+          const { data, error } = await client.storage.from(bucket).download(path);
+          if (error) throw new Error(friendlyError(error.message));
+          return data;
+        },
+        async removeObjects(bucket, paths) {
+          if (!paths.length) return;
+          const { error } = await client.storage.from(bucket).remove(paths);
+          if (error) throw new Error(friendlyError(error.message));
+        },
+        register: (id, encMeta, note, expiresIn) => rpc('register_file', {
+          p_id: id, p_enc_meta: encMeta, p_owner_note: note, p_expires_in: expiresIn,
+        }),
+        get: (id) => rpc('get_file', { p_id: id }),
+        mine: () => rpc('my_files'),
+        setShared: (id, shared) => rpc('set_file_shared', { p_id: id, p_shared: shared }),
+        remove: (id) => rpc('delete_file', { p_id: id }),
+      },
+
       admin: {
         overview: () => rpc('admin_overview'),
+        files: (query) => rpc('admin_files', { p_query: query || null, p_limit: 200 }),
+        deleteFile: (id) => rpc('admin_delete_file', { p_id: id }),
+        cleanupCandidates: () => rpc('admin_cleanup_candidates'),
+        userFilePaths: (id) => rpc('admin_user_file_paths', { p_user_id: id }),
+        setUserStorage: (id, mb) => rpc('admin_set_user_storage', { p_user_id: id, p_quota_mb: mb }),
+        setStorageSetting: (key, mb) => rpc('admin_set_storage_setting', { p_key: key, p_mb: mb }),
         reports: (status) => rpc('admin_reports', { p_status: status }),
         setReportStatus: (id, status) => rpc('admin_set_report_status', { p_id: id, p_status: status }),
         pastes: (query) => rpc('admin_pastes', { p_query: query || null, p_limit: 200, p_offset: 0 }),
@@ -484,10 +529,34 @@
   // The first account created becomes an admin so the dashboard can be tried out.
   function createDemoBackend() {
     const K = {
-      pastes: 'quickpaste:demo2-pastes', users: 'quickpaste:demo2-users', session: 'quickpaste:demo2-session',
-      admins: 'quickpaste:demo2-admins', settings: 'quickpaste:demo2-settings', limits: 'quickpaste:demo2-limits',
-      vaults: 'quickpaste:demo2-vaults', reports: 'quickpaste:demo2-reports',
+      pastes: 'quickpaste:demo3-pastes', users: 'quickpaste:demo3-users', session: 'quickpaste:demo3-session',
+      admins: 'quickpaste:demo3-admins', settings: 'quickpaste:demo3-settings', limits: 'quickpaste:demo3-limits',
+      vaults: 'quickpaste:demo3-vaults', reports: 'quickpaste:demo3-reports',
+      files: 'quickpaste:demo3-files', objects: 'quickpaste:demo3-objects',
     };
+    // File bytes live in IndexedDB (too big for localStorage); object metadata in localStorage.
+    const blobs = (() => {
+      let db;
+      const open = () => (db ||= new Promise((resolve, reject) => {
+        const req = indexedDB.open('quickpaste-demo', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('blobs');
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }));
+      const run = async (mode, fn) => {
+        const store = (await open()).transaction('blobs', mode).objectStore('blobs');
+        return new Promise((resolve, reject) => {
+          const req = fn(store);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      };
+      return {
+        put: (key, value) => run('readwrite', (s) => s.put(value, key)),
+        get: (key) => run('readonly', (s) => s.get(key)),
+        del: (key) => run('readwrite', (s) => s.delete(key)),
+      };
+    })();
     const read = (k, fallback) => { try { return JSON.parse(storage.get(k)) ?? fallback; } catch { return fallback; } };
     const write = (k, v) => storage.set(k, JSON.stringify(v));
     const hash = async (text) => toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(`demo:${text}`))));
@@ -502,8 +571,33 @@
     const uid = () => user?.id ?? null;
     const isAdmin = () => !!user && read(K.admins, []).includes(user.id);
     const requireAdmin = () => { if (!isAdmin()) throw new Error('Admins only'); };
-    const defaultLimit = () => read(K.settings, { custom_link_limit: 5 }).custom_link_limit;
-    const linkLimit = (id) => read(K.limits, {})[id] ?? defaultLimit();
+    const SETTINGS = { custom_link_limit: 5, storage_quota_mb: 25, admin_storage_quota_mb: 50, guest_pool_mb: 200 };
+    const settings = () => ({ ...SETTINGS, ...read(K.settings, {}) });
+    const defaultLimit = () => settings().custom_link_limit;
+    const linkLimit = (id) => read(K.limits, {})[id]?.links ?? defaultLimit();
+    const storageQuota = (id) => (read(K.limits, {})[id]?.storage
+      ?? (read(K.admins, []).includes(id) ? settings().admin_storage_quota_mb : settings().storage_quota_mb)) * MB;
+    const objects = () => read(K.objects, {});
+    const storageUsed = (id) => Object.entries(objects())
+      .filter(([key]) => key.startsWith(`files/${id}/`)).reduce((sum, [, o]) => sum + o.size, 0);
+    const guestPoolUsed = () => Object.entries(objects())
+      .filter(([key]) => key.startsWith('guest-files/')).reduce((sum, [, o]) => sum + o.size, 0);
+    const setLimit = (id, field, value) => {
+      const limits = read(K.limits, {});
+      limits[id] = { ...limits[id], [field]: value };
+      if (limits[id].links == null && limits[id].storage == null) delete limits[id];
+      write(K.limits, limits);
+    };
+    const fileJson = (f) => {
+      const { owner_id, owner_note, ...rest } = f;
+      return { ...rest, is_owner: !!user && owner_id === user.id, guest: !owner_id, expired: isExpired(f) };
+    };
+    const removeObject = async (key) => {
+      const all = objects();
+      delete all[key];
+      write(K.objects, all);
+      await blobs.del(key);
+    };
     const usersById = () => Object.fromEntries(Object.values(read(K.users, {})).map((u) => [u.id, u]));
     const toJson = (p) => {
       const { password_hash, owner_id, owner_note, ...rest } = p;
@@ -584,7 +678,10 @@
       async myAccount() {
         if (!user) return null;
         const used = Object.values(read(K.pastes, {})).filter((p) => p.owner_id === uid() && p.is_custom).length;
-        return { is_admin: isAdmin(), custom_used: used, custom_limit: linkLimit(uid()), has_vault: !!read(K.vaults, {})[uid()] };
+        return {
+          is_admin: isAdmin(), custom_used: used, custom_limit: linkLimit(uid()), has_vault: !!read(K.vaults, {})[uid()],
+          storage_used: storageUsed(uid()), storage_quota: storageQuota(uid()),
+        };
       },
       async getVault() {
         return read(K.vaults, {})[uid()] || null;
@@ -645,16 +742,147 @@
         return true;
       },
 
+      // Mirrors the Storage policies and file functions in schema.sql.
+      files: {
+        async upload(bucket, path, blob) {
+          const max = bucket === 'files' ? USER_FILE_MAX : GUEST_FILE_MAX;
+          if (blob.size > max) throw new Error('That file is too large');
+          const folder = path.split('/')[0];
+          if (bucket === 'files' && (!uid() || folder !== uid() || storageUsed(uid()) >= storageQuota(uid()))) {
+            throw new Error('Upload refused — you may be out of storage space');
+          }
+          if (bucket === 'guest-files' && (folder !== 'guest' || guestPoolUsed() >= settings().guest_pool_mb * MB)) {
+            throw new Error('Guest storage is full right now — sign in to upload');
+          }
+          const key = `${bucket}/${path}`;
+          const all = objects();
+          if (all[key]) throw new Error('That file already exists');
+          await blobs.put(key, blob);
+          all[key] = { size: blob.size, created_at: new Date().toISOString() };
+          write(K.objects, all);
+        },
+        async download(bucket, path) {
+          const key = `${bucket}/${path}`;
+          const f = Object.values(read(K.files, {})).find((x) => x.bucket === bucket && x.object_path === path);
+          const mine = bucket === 'files' && uid() && path.startsWith(`${uid()}/`);
+          if (!mine && !(f && f.shared && !isExpired(f))) throw new Error('Object not found');
+          const blob = await blobs.get(key);
+          if (!blob) throw new Error('Object not found');
+          return blob;
+        },
+        async removeObjects(bucket, paths) {
+          for (const path of paths) {
+            const mine = bucket === 'files' && uid() && path.startsWith(`${uid()}/`);
+            if (!mine && !isAdmin()) throw new Error('Not allowed');
+            await removeObject(`${bucket}/${path}`);
+          }
+        },
+        async register(id, encMeta, note, expiresIn) {
+          if (!LOOKUP_RE.test(id)) throw new Error('Invalid file id');
+          if (!uid() && ![3600, 86400, 604800].includes(expiresIn)) throw new Error('Guest uploads must expire within a week');
+          const bucket = uid() ? 'files' : 'guest-files';
+          const path = uid() ? `${uid()}/${id}` : `guest/${id}`;
+          const object = objects()[`${bucket}/${path}`];
+          if (!object) throw new Error('Upload the file first');
+          const all = read(K.files, {});
+          if (all[id]) throw new Error('That file is already registered');
+          all[id] = {
+            id, owner_id: uid(), bucket, object_path: path, enc_meta: encMeta, owner_note: uid() ? note : null,
+            size: object.size, shared: !uid(), downloads: 0, created_at: new Date().toISOString(),
+            updated_at: null, expires_at: expiry(expiresIn),
+          };
+          write(K.files, all);
+          return fileJson(all[id]);
+        },
+        async get(id) {
+          const all = read(K.files, {});
+          const f = all[id];
+          if (!f) return null;
+          if (f.owner_id && f.owner_id === uid()) return fileJson(f);
+          if (!f.shared || isExpired(f)) return null;
+          f.downloads += 1;
+          write(K.files, all);
+          return fileJson(f);
+        },
+        async mine() {
+          if (!user) return null;
+          const files = Object.values(read(K.files, {}))
+            .filter((f) => f.owner_id === uid())
+            .sort((a, b) => b.created_at.localeCompare(a.created_at))
+            .map((f) => ({ ...fileJson(f), owner_note: f.owner_note }));
+          return { used: storageUsed(uid()), quota: storageQuota(uid()), files };
+        },
+        async setShared(id, shared) {
+          const all = read(K.files, {});
+          const f = all[id];
+          if (!f || f.owner_id !== uid()) throw new Error('File not found');
+          f.shared = !!shared;
+          write(K.files, all);
+          return fileJson(f);
+        },
+        async remove(id) {
+          const all = read(K.files, {});
+          if (!all[id] || all[id].owner_id !== uid()) return false;
+          delete all[id];
+          write(K.files, all);
+          return true;
+        },
+      },
+
       admin: {
         async overview() {
           requireAdmin();
           const pastes = Object.values(read(K.pastes, {}));
+          const files = Object.values(read(K.files, {}));
+          const s = settings();
           return {
             pastes: pastes.length, encrypted: pastes.filter((p) => p.enc).length,
             users: Object.keys(read(K.users, {})).length,
             open_reports: read(K.reports, []).filter((r) => r.status === 'open').length,
-            default_limit: defaultLimit(),
+            files: files.length, storage_bytes: files.reduce((sum, f) => sum + f.size, 0),
+            guest_pool_used: guestPoolUsed(), default_limit: s.custom_link_limit,
+            storage_quota_mb: s.storage_quota_mb, admin_storage_quota_mb: s.admin_storage_quota_mb, guest_pool_mb: s.guest_pool_mb,
           };
+        },
+        async files(query) {
+          requireAdmin();
+          const q = (query || '').trim().toLowerCase();
+          const users = usersById();
+          return Object.values(read(K.files, {}))
+            .map((f) => ({ ...fileJson(f), owner_email: users[f.owner_id]?.email || null }))
+            .filter((f) => !q || f.id === q || (f.owner_email || '').toLowerCase().includes(q))
+            .sort((a, b) => b.created_at.localeCompare(a.created_at));
+        },
+        async deleteFile(id) {
+          requireAdmin();
+          const all = read(K.files, {});
+          delete all[id];
+          write(K.files, all);
+          return true;
+        },
+        async cleanupCandidates() {
+          requireAdmin();
+          const files = Object.values(read(K.files, {}));
+          const expired = files.filter(isExpired).map((f) => ({ bucket: f.bucket, path: f.object_path, file_id: f.id }));
+          const hourAgo = Date.now() - 3600000;
+          const orphans = Object.entries(objects())
+            .filter(([key, o]) => new Date(o.created_at).getTime() < hourAgo
+              && !files.some((f) => `${f.bucket}/${f.object_path}` === key))
+            .map(([key]) => ({ bucket: key.split('/')[0], path: key.split('/').slice(1).join('/'), file_id: null }));
+          return [...expired, ...orphans];
+        },
+        async userFilePaths(id) {
+          requireAdmin();
+          return Object.keys(objects()).filter((k) => k.startsWith(`files/${id}/`)).map((k) => k.slice('files/'.length));
+        },
+        async setUserStorage(id, mb) {
+          requireAdmin();
+          setLimit(id, 'storage', mb);
+        },
+        async setStorageSetting(key, mb) {
+          requireAdmin();
+          if (!['storage_quota_mb', 'admin_storage_quota_mb', 'guest_pool_mb'].includes(key)) throw new Error('Unknown setting');
+          write(K.settings, { ...read(K.settings, {}), [key]: mb });
         },
         async reports(status) {
           requireAdmin();
@@ -727,6 +955,7 @@
           requireAdmin();
           const q = (query || '').trim().toLowerCase();
           const pastes = Object.values(read(K.pastes, {}));
+          const files = Object.values(read(K.files, {}));
           const admins = read(K.admins, []);
           const limits = read(K.limits, {});
           return Object.values(read(K.users, {}))
@@ -736,7 +965,10 @@
               id: u.id, email: u.email, created_at: u.created_at, last_sign_in_at: u.last_sign_in_at,
               pastes: pastes.filter((p) => p.owner_id === u.id).length,
               custom_used: pastes.filter((p) => p.owner_id === u.id && p.is_custom).length,
-              custom_limit_override: limits[u.id] ?? null, custom_limit: linkLimit(u.id),
+              custom_limit_override: limits[u.id]?.links ?? null, custom_limit: linkLimit(u.id),
+              files: files.filter((f) => f.owner_id === u.id).length,
+              storage_used: storageUsed(u.id), storage_quota: storageQuota(u.id),
+              storage_quota_override: limits[u.id]?.storage ?? null,
               is_admin: admins.includes(u.id), is_me: u.id === uid(),
             }));
         },
@@ -750,16 +982,17 @@
           const all = read(K.pastes, {});
           for (const [key, p] of Object.entries(all)) if (p.owner_id === id) delete all[key];
           write(K.pastes, all);
+          const files = read(K.files, {});
+          for (const [key, f] of Object.entries(files)) if (f.owner_id === id) delete files[key];
+          write(K.files, files);
         },
         async setUserLimit(id, limit) {
           requireAdmin();
-          const limits = read(K.limits, {});
-          if (limit == null) delete limits[id]; else limits[id] = limit;
-          write(K.limits, limits);
+          setLimit(id, 'links', limit);
         },
         async setDefaultLimit(limit) {
           requireAdmin();
-          write(K.settings, { custom_link_limit: limit });
+          write(K.settings, { ...read(K.settings, {}), custom_link_limit: limit });
         },
       },
 
@@ -827,7 +1060,7 @@
       }
     }
     renderAccount();
-    if (changed && booted && ['mine', 'edit', 'admin'].includes(parseRoute().name)) navigate();
+    if (changed && booted && ['mine', 'edit', 'admin', 'files'].includes(parseRoute().name)) navigate();
   }
 
   async function refreshAccount() {
@@ -1048,6 +1281,112 @@
       throw err;
     }
   }
+
+  // ───────── File service ─────────
+  // Same scheme as pastes: a random link → lookup id + AES key. The bytes are
+  // encrypted with that key (AAD = lookup id) before upload; name and type go
+  // into enc_meta, encrypted with the same key.
+
+  const fileMax = () => (currentUser ? USER_FILE_MAX : GUEST_FILE_MAX);
+
+  async function uploadFile(file, expiresIn) {
+    const guest = !currentUser;
+    if (file.size + GCM_OVERHEAD > fileMax()) throw new Error(`Larger than ${formatBytes(fileMax())}`);
+    if (!file.size) throw new Error('This file is empty');
+    if (!guest && !vaultKey) throw new Error('Unlock your account first');
+    const link = newLink();
+    const { lookup, key } = await linkSecrets(link);
+    const aes = await aesKey(key);
+    const iv = randomBytes(12);
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: te.encode(lookup) }, aes, await file.arrayBuffer(),
+    );
+    const blob = new Blob([iv, ciphertext], { type: 'application/octet-stream' });
+    const meta = { name: file.name, type: file.type || 'application/octet-stream', size: file.size };
+    const encMeta = await sealJson(aes, meta, `${lookup}:meta`);
+    const note = guest ? null : await sealNote({ link, ...meta });
+    const bucket = guest ? 'guest-files' : 'files';
+    const path = guest ? `guest/${lookup}` : `${currentUser.id}/${lookup}`;
+    await api.files.upload(bucket, path, blob);
+    try {
+      const row = await api.files.register(lookup, encMeta, note, expiresIn);
+      return { ...row, link, meta };
+    } catch (err) {
+      if (!guest) await api.files.removeObjects(bucket, [path]).catch(() => {});
+      throw err;
+    }
+  }
+
+  // Open a file by link: returns its row plus decrypted name/type, or null.
+  async function openFile(link) {
+    const { lookup, key } = await linkSecrets(normLink(link));
+    const row = await api.files.get(lookup);
+    if (!row) return null;
+    const aes = await aesKey(key);
+    let meta;
+    try {
+      meta = await unsealJson(aes, row.enc_meta, `${lookup}:meta`);
+    } catch {
+      throw new Error('This file couldn’t be decrypted');
+    }
+    return { ...row, link: normLink(link), meta, aes };
+  }
+
+  function saveBlob(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = Object.assign(document.createElement('a'), { href: url, download: name || 'download' });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  async function downloadFile(f) {
+    const blob = await api.files.download(f.bucket, f.object_path);
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let plain;
+    try {
+      plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: bytes.slice(0, 12), additionalData: te.encode(f.id) }, f.aes, bytes.slice(12),
+      );
+    } catch {
+      throw new Error('This file couldn’t be decrypted');
+    }
+    saveBlob(new Blob([plain], { type: f.meta.type }), f.meta.name);
+  }
+
+  async function loadMyFiles() {
+    const data = (await api.files.mine()) || { used: 0, quota: 0, files: [] };
+    data.files = await Promise.all(data.files.map(async (f) => {
+      const note = await openNote(f.owner_note);
+      return { ...f, link: note?.link || null, meta: note ? { name: note.name, type: note.type, size: note.size } : null };
+    }));
+    return data;
+  }
+
+  async function deleteMyFile(f) {
+    const ok = await confirmDialog({
+      title: `Delete “${f.meta?.name || 'this file'}”?`,
+      message: 'It will be removed from your storage and its link will stop working. This can’t be undone.',
+      confirmLabel: 'Delete', destructive: true,
+    });
+    if (!ok) return false;
+    try {
+      await api.files.removeObjects(f.bucket, [f.object_path]);
+      await api.files.remove(f.id);
+      refreshAccount();
+      toast('File deleted');
+      return true;
+    } catch (err) {
+      toast(err.message || 'Couldn’t delete the file', 'error');
+      return false;
+    }
+  }
+
+  const fileExt = (name = '') => (name.includes('.') ? name.split('.').pop().slice(0, 4).toUpperCase() : 'FILE');
+  const fileBadge = (name, locked = false) => (locked
+    ? `<span class="lang-badge" style="--c:#8e8e93">${icon('lock')}</span>`
+    : `<span class="lang-badge" style="--c:#5e5ce6">${esc(fileExt(name))}</span>`);
 
   // ───────── Language detection ─────────
 
@@ -1754,7 +2093,7 @@
 
   // ───────── View: my pastes ─────────
 
-  function viewUnlockVault() {
+  function viewUnlockVault(next = async () => viewMine(await loadMine())) {
     return viewPasswordPrompt({
       glyph: 'unlock',
       heading: 'Unlock your pastes',
@@ -1765,7 +2104,7 @@
         await api.auth.signIn(currentUser.email, pw); // verifies the password
         await unlockVault(pw);
         toast('Unlocked');
-        return viewMine(await loadMine());
+        return next();
       },
     });
   }
@@ -1849,9 +2188,235 @@
     return page;
   }
 
+  // ───────── View: files ─────────
+
+  // data: { used, quota, files } for signed-in users, null for guests.
+  function viewFiles(data) {
+    const guest = !currentUser;
+    const expOptions = FILE_EXPIRATIONS[guest ? 'guest' : 'user']
+      .map(([v, l]) => `<option value="${v}" ${guest && v === '86400' ? 'selected' : ''}>${l}</option>`).join('');
+    const page = html(`
+      <div class="page page-files">
+        <header class="page-head">
+          <h1 class="reveal">Files</h1>
+          <p class="reveal" style="--d:1">${guest
+            ? 'Share a file with an encrypted link — no account needed.'
+            : 'Your encrypted cloud. Files stay private until you share their link.'}</p>
+        </header>
+        ${data ? `
+          <div class="storage card reveal" style="--d:1">
+            <div class="storage-top"><strong class="storage-used"></strong><span class="storage-of"></span></div>
+            <div class="storage-bar"><span></span></div>
+          </div>` : ''}
+        <label class="dropzone card reveal" style="--d:2">
+          <input type="file" multiple hidden>
+          <span class="dz-icon">${icon('upload')}</span>
+          <strong>Drop files here or click to choose</strong>
+          <small>Up to ${formatBytes(fileMax())} each · encrypted in your browser before upload</small>
+        </label>
+        <div class="upload-options reveal" style="--d:2">
+          <span>${guest ? 'Delete after' : 'Expires'}</span>
+          <label class="select small"><select name="expires" aria-label="Expiration">${expOptions}</select></label>
+        </div>
+        ${guest ? `<p class="create-note"><span>Guest uploads are limited to ${formatBytes(GUEST_FILE_MAX)} and always expire. <a href="#/login">Sign in</a> for private storage you control.</span></p>` : ''}
+        <ul class="upload-queue"></ul>
+        ${data ? '<h2 class="section-label reveal" style="--d:3">Your files</h2><ul class="mine-list card file-list reveal" style="--d:3"></ul>' : ''}
+      </div>`).firstElementChild;
+
+    const input = $('input[type=file]', page);
+    const zone = $('.dropzone', page);
+    const queue = $('.upload-queue', page);
+    const expires = $('select[name=expires]', page);
+    const list = $('.file-list', page);
+
+    function renderUsage() {
+      if (!data) return;
+      const pct = data.quota ? Math.min(100, (data.used / data.quota) * 100) : 100;
+      $('.storage-used', page).textContent = formatBytes(data.used);
+      $('.storage-of', page).textContent = `of ${formatBytes(data.quota)} used`;
+      const bar = $('.storage-bar span', page);
+      bar.style.width = `${pct}%`;
+      bar.classList.toggle('full', pct >= 90);
+    }
+
+    const fileRow = (f) => {
+      const name = f.meta?.name || 'Locked file';
+      const pills = [f.shared
+        ? `<span class="pill blue">${icon('link')}Shared</span>`
+        : `<span class="pill">${icon('lock')}Private</span>`];
+      if (f.expired) pills.push(`<span class="pill red">${icon('timer')}Expired</span>`);
+      else if (f.expires_at) pills.push(`<span class="pill">${icon('timer')}${esc(relativeTime(f.expires_at))}</span>`);
+      const details = [formatBytes(f.meta?.size ?? f.size), relativeTime(f.created_at), plural(f.downloads || 0, 'view')];
+      const main = `
+        ${fileBadge(name, !f.link)}
+        <span class="mine-text">
+          <strong>${esc(name)}</strong>
+          <small>${details.map(esc).join(' · ')}</small>
+          <span class="pills">${pills.join('')}</span>
+        </span>`;
+      return `
+        <li class="mine-row" data-id="${esc(f.id)}">
+          ${f.link ? `<a class="mine-main" href="#/f/${esc(f.link)}">${main}</a>` : `<div class="mine-main">${main}</div>`}
+          <div class="mine-actions">
+            ${f.link ? `
+              <button class="btn icon-only ghost" type="button" data-act="download" title="Download" aria-label="Download">${icon('download')}</button>
+              <button class="btn icon-only ghost ${f.shared ? 'on' : ''}" type="button" data-act="share" title="${f.shared ? 'Stop sharing' : 'Share link'}" aria-label="${f.shared ? 'Stop sharing' : 'Share link'}" aria-pressed="${f.shared}">${icon('link')}</button>` : ''}
+            <button class="btn icon-only ghost danger" type="button" data-act="delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
+          </div>
+        </li>`;
+    };
+    function renderList() {
+      if (!list) return;
+      list.innerHTML = data.files.length
+        ? data.files.map(fileRow).join('')
+        : `<li class="admin-empty">${icon('folder')}<span>No files yet — drop something above.</span></li>`;
+    }
+
+    list?.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const f = data.files.find((x) => x.id === btn.closest('.mine-row').dataset.id);
+      if (btn.dataset.act === 'download') {
+        btn.disabled = true;
+        try { await downloadFile(await openFile(f.link)); } catch (err) { toast(err.message, 'error'); }
+        btn.disabled = false;
+      }
+      if (btn.dataset.act === 'share') {
+        try {
+          const row = await api.files.setShared(f.id, !f.shared);
+          f.shared = row.shared;
+          if (f.shared) {
+            const copied = await copyText(fileUrl(f.link));
+            toast(copied ? 'Sharing on — link copied' : 'Sharing on');
+          } else {
+            toast('Sharing off — only you can open it');
+          }
+          renderList();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      }
+      if (btn.dataset.act === 'delete' && (await deleteMyFile(f))) {
+        data.files.splice(data.files.indexOf(f), 1);
+        data.used = Math.max(0, data.used - f.size);
+        renderList();
+        renderUsage();
+      }
+    });
+
+    async function handle(files) {
+      for (const file of files) {
+        const item = html(`
+          <li class="upload-item">
+            ${fileBadge(file.name)}
+            <span class="mine-text"><strong>${esc(file.name)}</strong><small class="status">Encrypting…</small></span>
+            <span class="spinner dark"></span>
+          </li>`).firstElementChild;
+        queue.prepend(item);
+        const status = $('.status', item);
+        try {
+          status.textContent = `Encrypting and uploading ${formatBytes(file.size)}…`;
+          const expiresIn = expires.value ? Number(expires.value) : null;
+          const f = await uploadFile(file, expiresIn);
+          item.classList.add('done');
+          $('.spinner', item).remove();
+          status.innerHTML = `Uploaded · <a href="#/f/${esc(f.link)}">#/f/${esc(f.link)}</a>`;
+          item.insertAdjacentHTML('beforeend', `<button class="btn small" type="button">${icon('link')}<span>Copy link</span></button>`);
+          $('button', item).addEventListener('click', async () => toast((await copyText(fileUrl(f.link))) ? 'Link copied' : 'Couldn’t copy'));
+          if (data) {
+            data.files.unshift({ ...f, meta: f.meta });
+            data.used += f.size;
+            renderList();
+            renderUsage();
+            refreshAccount();
+          }
+        } catch (err) {
+          item.classList.add('failed');
+          $('.spinner', item)?.remove();
+          status.textContent = err.message || 'Upload failed';
+        }
+      }
+    }
+
+    input.addEventListener('change', () => { handle([...input.files]); input.value = ''; });
+    let depth = 0;
+    zone.addEventListener('dragenter', (e) => { if (e.dataTransfer?.types.includes('Files')) { depth++; zone.classList.add('dragging'); } });
+    zone.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; zone.classList.remove('dragging'); } });
+    zone.addEventListener('dragover', (e) => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      depth = 0;
+      zone.classList.remove('dragging');
+      handle([...(e.dataTransfer?.files || [])]);
+    });
+
+    renderUsage();
+    renderList();
+    page.docTitle = 'Files · QuickPaste';
+    return page;
+  }
+
+  const fileUrl = (link) => `${location.origin}${location.pathname}#/f/${link}`;
+
+  function viewFile(f) {
+    const owner = !!f.is_owner;
+    const meta = [
+      `<span>${icon('doc')}${esc(formatBytes(f.meta.size ?? f.size))}</span>`,
+      `<span class="secure">${icon('shield')}End-to-end encrypted</span>`,
+      `<span>${icon('clock')}${esc(relativeTime(f.created_at))}</span>`,
+    ];
+    if (f.expires_at) meta.push(`<span>${icon('timer')}${f.expired ? 'Expired' : `Expires ${esc(relativeTime(f.expires_at))}`}</span>`);
+    if (owner) meta.push(`<span>${icon('eye')}${plural(f.downloads || 0, 'view')}</span>`);
+
+    const page = html(`
+      <div class="page page-file">
+        <div class="file-card card reveal">
+          <div class="file-glyph">${esc(fileExt(f.meta.name))}</div>
+          <h1>${esc(f.meta.name)}</h1>
+          <div class="meta">${meta.join('')}</div>
+          ${owner && !f.shared ? `<div class="banner info">${icon('lock')}<div>Only you can open this link. Turn on sharing to let others download it.</div></div>` : ''}
+          <div class="file-actions">
+            <button class="btn primary large" type="button" data-act="download"><span class="label">${icon('download')} Download</span><span class="spinner"></span></button>
+            <div class="file-secondary">
+              <button class="btn" type="button" data-act="copy">${icon('link')}<span>Copy Link</span></button>
+              ${owner ? `<button class="btn" type="button" data-act="share">${icon(f.shared ? 'lock' : 'share')}<span>${f.shared ? 'Stop Sharing' : 'Share'}</span></button>
+                <button class="btn icon-only danger-soft" type="button" data-act="delete" title="Delete" aria-label="Delete">${icon('trash')}</button>` : ''}
+            </div>
+          </div>
+          <p class="fine">Decrypted in your browser — ${owner ? 'the server only ever sees scrambled bytes.' : 'the server never sees this file.'}</p>
+        </div>
+      </div>`).firstElementChild;
+
+    $('.file-actions', page).addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      if (btn.dataset.act === 'download') {
+        btn.disabled = true;
+        btn.classList.add('loading');
+        try { await downloadFile(f); } catch (err) { toast(err.message, 'error'); }
+        btn.disabled = false;
+        btn.classList.remove('loading');
+      }
+      if (btn.dataset.act === 'copy') toast((await copyText(fileUrl(f.link))) ? 'Link copied' : 'Couldn’t copy link');
+      if (btn.dataset.act === 'share') {
+        try {
+          const row = await api.files.setShared(f.id, !f.shared);
+          toast(row.shared ? 'Sharing on — anyone with the link can download it' : 'Sharing off — only you can open it');
+          navigate();
+        } catch (err) {
+          toast(err.message, 'error');
+        }
+      }
+      if (btn.dataset.act === 'delete' && (await deleteMyFile(f))) location.hash = '#/files';
+    });
+
+    page.docTitle = `${f.meta.name} · QuickPaste`;
+    return page;
+  }
+
   // ───────── View: admin dashboard ─────────
 
-  const ADMIN_TABS = [['reports', 'Reports'], ['pastes', 'Pastes'], ['users', 'Users'], ['settings', 'Settings']];
+  const ADMIN_TABS = [['reports', 'Reports'], ['pastes', 'Pastes'], ['files', 'Files'], ['users', 'Users'], ['settings', 'Settings']];
 
   function viewAdmin(tab, stats) {
     const index = ADMIN_TABS.findIndex(([k]) => k === tab);
@@ -1867,22 +2432,23 @@
         <div class="stats reveal" style="--d:1">
           ${tile('Open reports', stats.open_reports, 'flag', '#ff3b30')}
           ${tile('Pastes', stats.pastes, 'doc', '#0a84ff')}
-          ${tile('Encrypted', stats.encrypted, 'shield', '#34c759')}
+          ${tile(`Files · ${formatBytes(stats.storage_bytes || 0)}`, stats.files, 'folder', '#34c759')}
           ${tile('Users', stats.users, 'users', '#5e5ce6')}
         </div>
-        <nav class="segmented admin-tabs reveal" style="--d:2;--n:4;--i:${index}" aria-label="Admin sections">
+        <nav class="segmented admin-tabs reveal" style="--d:2;--n:${ADMIN_TABS.length};--i:${index}" aria-label="Admin sections">
           ${ADMIN_TABS.map(([k, l]) => `<a href="#/admin/${k}" aria-current="${k === tab ? 'page' : 'false'}">${l}</a>`).join('')}
         </nav>
         <section class="admin-panel reveal" style="--d:3"></section>
       </div>`).firstElementChild;
 
     const panel = $('.admin-panel', page);
-    const renderers = { reports: adminReports, pastes: adminPastes, users: adminUsers, settings: adminSettings };
+    const renderers = { reports: adminReports, pastes: adminPastes, files: adminFiles, users: adminUsers, settings: adminSettings };
     const refreshStats = async () => {
       try {
         const s = await api.admin.overview();
-        const values = [s.open_reports, s.pastes, s.encrypted, s.users];
+        const values = [s.open_reports, s.pastes, s.files, s.users];
         page.querySelectorAll('.stat strong').forEach((n, i) => { n.textContent = Number(values[i] || 0).toLocaleString(); });
+        page.querySelectorAll('.stat small')[2].textContent = `Files · ${formatBytes(s.storage_bytes || 0)}`;
       } catch { /* keep old numbers */ }
     };
     renderers[tab](panel, { refreshStats, stats });
@@ -2126,6 +2692,87 @@
     load();
   }
 
+  function adminFiles(panel, ctx) {
+    panel.innerHTML = `
+      <div class="panel-bar">
+        <input class="search" type="search" placeholder="Search by owner email or id" aria-label="Search files">
+        <button class="btn small" type="button" data-act="cleanup" title="Remove expired files and abandoned uploads">${icon('trash')}<span>Clean up</span></button>
+      </div>
+      <p class="panel-note">${icon('shield')}<span>File names and contents are encrypted — admins see only size, owner and dates.
+        Guest pool: ${formatBytes(ctx.stats.guest_pool_used || 0)} of ${formatBytes((ctx.stats.guest_pool_mb ?? 200) * MB)} used.</span></p>
+      <ul class="admin-list card"></ul>`;
+    const list = $('.admin-list', panel);
+    const search = $('.search', panel);
+    let rows = [];
+
+    async function load() {
+      try {
+        rows = await api.admin.files(search.value.trim());
+      } catch (err) {
+        list.innerHTML = `<li class="admin-empty">${esc(err.message)}</li>`;
+        return;
+      }
+      if (!rows.length) {
+        list.innerHTML = `<li class="admin-empty">${icon('folder')}<span>No files found.</span></li>`;
+        return;
+      }
+      list.innerHTML = rows.map((f) => {
+        const pills = [f.shared ? `<span class="pill blue">${icon('link')}Shared</span>` : `<span class="pill">${icon('lock')}Private</span>`];
+        if (f.guest) pills.push(`<span class="pill orange">${icon('person')}Guest</span>`);
+        if (f.expired) pills.push(`<span class="pill red">${icon('timer')}Expired</span>`);
+        else if (f.expires_at) pills.push(`<span class="pill">${icon('timer')}${esc(relativeTime(f.expires_at))}</span>`);
+        const sub = [f.owner_email || 'Guest', formatBytes(f.size), relativeTime(f.created_at), plural(f.downloads || 0, 'view')];
+        return `
+          <li class="admin-item" data-id="${esc(f.id)}">
+            ${fileBadge('', true)}
+            <div class="admin-item-main">
+              <strong>Encrypted file</strong>
+              <small>${esc(sub.join(' · '))}</small>
+              <span class="pills">${pills.join('')}</span>
+            </div>
+            <div class="admin-actions">
+              <button class="btn icon-only ghost danger" type="button" data-act="delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
+            </div>
+          </li>`;
+      }).join('');
+    }
+
+    list.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act=delete]');
+      if (!btn) return;
+      const f = rows.find((x) => x.id === btn.closest('.admin-item').dataset.id);
+      const ok = await confirmDialog({
+        title: 'Delete this file?', message: 'It will be removed from storage for everyone. This can’t be undone.',
+        confirmLabel: 'Delete', destructive: true,
+      });
+      if (!ok) return;
+      if (await adminAction(async () => {
+        await api.files.removeObjects(f.bucket, [f.object_path]);
+        await api.admin.deleteFile(f.id);
+      }, 'File deleted')) { load(); ctx.refreshStats(); }
+    });
+
+    $('[data-act=cleanup]', panel).addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      await adminAction(async () => {
+        const items = await api.admin.cleanupCandidates();
+        const byBucket = {};
+        for (const it of items) (byBucket[it.bucket] ||= []).push(it.path);
+        for (const [bucket, paths] of Object.entries(byBucket)) await api.files.removeObjects(bucket, paths);
+        for (const it of items) if (it.file_id) await api.admin.deleteFile(it.file_id);
+        toast(items.length ? `Removed ${plural(items.length, 'file')}` : 'Nothing to clean up');
+      });
+      btn.disabled = false;
+      load();
+      ctx.refreshStats();
+    });
+
+    let timer;
+    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 300); });
+    load();
+  }
+
   function adminUsers(panel, ctx) {
     panel.innerHTML = `
       <div class="panel-bar">
@@ -2163,15 +2810,26 @@
                 ${u.is_admin ? `<span class="pill blue">${icon('shield')}Admin</span>` : ''}
                 ${u.is_me ? '<span class="pill">You</span>' : ''}
                 <span class="pill">${icon('link')}${u.custom_used} of ${u.custom_limit} custom links${u.custom_limit_override == null ? ' (default)' : ''}</span>
+                <span class="pill">${icon('folder')}${formatBytes(u.storage_used || 0)} of ${formatBytes(u.storage_quota || 0)}${u.storage_quota_override == null ? ' (default)' : ''}</span>
               </span>
             </div>
             <div class="admin-actions">
-              <label class="limit-field" title="Custom link limit">
-                <span>Limit</span>
-                <input type="number" min="0" max="10000" step="1" value="${u.custom_limit}" aria-label="Custom link limit for ${esc(u.email)}">
-              </label>
-              <button class="btn small" type="button" data-act="limit">Save</button>
-              ${u.custom_limit_override != null ? '<button class="btn small ghost" type="button" data-act="reset">Use default</button>' : ''}
+              <div class="limit-group">
+                <label class="limit-field" title="Custom link limit">
+                  <span>Links</span>
+                  <input type="number" name="links" min="0" max="10000" step="1" value="${u.custom_limit}" aria-label="Custom link limit for ${esc(u.email)}">
+                </label>
+                <button class="btn small" type="button" data-act="limit">Save</button>
+                ${u.custom_limit_override != null ? '<button class="btn small ghost" type="button" data-act="reset">Default</button>' : ''}
+              </div>
+              <div class="limit-group">
+                <label class="limit-field" title="Storage limit in MB">
+                  <span>MB</span>
+                  <input type="number" name="storage" min="0" max="100000" step="1" value="${Math.round((u.storage_quota || 0) / MB)}" aria-label="Storage limit in MB for ${esc(u.email)}">
+                </label>
+                <button class="btn small" type="button" data-act="storage">Save</button>
+                ${u.storage_quota_override != null ? '<button class="btn small ghost" type="button" data-act="storage-reset">Default</button>' : ''}
+              </div>
               <button class="btn icon-only ghost danger" type="button" data-act="delete" title="${u.is_me || u.is_admin ? 'Admins can’t be deleted here' : 'Delete user'}" aria-label="Delete user" ${u.is_me || u.is_admin ? 'disabled' : ''}>${icon('trash')}</button>
             </div>
           </li>`;
@@ -2183,8 +2841,22 @@
       if (!btn) return;
       const item = btn.closest('.admin-item');
       const u = users.find((x) => x.id === item.dataset.id);
+      if (btn.dataset.act === 'storage') {
+        const value = Number($('input[name=storage]', item).value);
+        if (!Number.isInteger(value) || value < 0 || value > 100000) return toast('Enter a number of MB from 0 to 100,000', 'error');
+        if (await adminAction(() => api.admin.setUserStorage(u.id, value), `${u.email} can now store ${value} MB`)) {
+          load();
+          if (u.is_me) refreshAccount();
+        }
+      }
+      if (btn.dataset.act === 'storage-reset') {
+        if (await adminAction(() => api.admin.setUserStorage(u.id, null), `${u.email} is back to the default storage`)) {
+          load();
+          if (u.is_me) refreshAccount();
+        }
+      }
       if (btn.dataset.act === 'limit') {
-        const value = Number($('input', item).value);
+        const value = Number($('input[name=links]', item).value);
         if (!Number.isInteger(value) || value < 0 || value > 10000) return toast('Enter a number from 0 to 10,000', 'error');
         if (await adminAction(() => api.admin.setUserLimit(u.id, value), `${u.email} can now use ${plural(value, 'custom link')}`)) {
           load();
@@ -2200,10 +2872,15 @@
       if (btn.dataset.act === 'delete') {
         const ok = await confirmDialog({
           title: `Delete ${u.email}?`,
-          message: `Their account and ${plural(u.pastes, 'paste')} will be deleted. This can’t be undone.`,
+          message: `Their account, ${plural(u.pastes, 'paste')} and ${plural(u.files || 0, 'file')} will be deleted. This can’t be undone.`,
           confirmLabel: 'Delete User', destructive: true,
         });
-        if (ok && (await adminAction(() => api.admin.deleteUser(u.id), 'User deleted'))) { load(); ctx.refreshStats(); }
+        const removeAll = async () => {
+          // Storage bytes aren't deleted by the database cascade, so remove them first.
+          await api.files.removeObjects('files', (await api.admin.userFilePaths(u.id)) || []);
+          await api.admin.deleteUser(u.id);
+        };
+        if (ok && (await adminAction(removeAll, 'User deleted'))) { load(); ctx.refreshStats(); }
       }
     });
     let timer;
@@ -2226,6 +2903,25 @@
           </div>
         </div>
       </div>
+      <h2 class="section-label">File storage</h2>
+      <div class="group card storage-settings">
+        ${[
+          ['storage_quota_mb', 'Registered users', 'Total storage per account, unless you set a personal limit under Users', '#34c759', 'person'],
+          ['admin_storage_quota_mb', 'Admins', 'Total storage per admin account', '#0a84ff', 'shield'],
+          ['guest_pool_mb', 'Guest pool', `Shared by all guest uploads (max ${formatBytes(GUEST_FILE_MAX)} each, always expire)`, '#ff9500', 'users'],
+        ].map(([key, label, hint, color, glyph]) => `
+          <div class="row">
+            <div class="row-label">
+              <span class="row-icon" style="background:${color}">${icon(glyph)}</span>
+              <span class="row-text">${label}<small>${hint}</small></span>
+            </div>
+            <div class="limit-inline">
+              <input type="number" min="0" max="100000" step="1" data-key="${key}" value="${Number(ctx.stats[key] ?? 0)}" aria-label="${label} storage in MB">
+              <span class="unit">MB</span>
+              <button class="btn small primary" type="button" data-save="${key}">Save</button>
+            </div>
+          </div>`).join('')}
+      </div>
       <h2 class="section-label">Admins</h2>
       <div class="group card info-card">
         <p>To make someone an admin, run this in the Supabase SQL Editor:</p>
@@ -2233,6 +2929,13 @@
 select id from auth.users where email = 'them@example.com';</code></pre>
         <p>Admins can’t read encrypted pastes unless someone reports one with its link.</p>
       </div>`;
+    $('.storage-settings', panel).addEventListener('click', async (e) => {
+      const key = e.target.closest('[data-save]')?.dataset.save;
+      if (!key) return;
+      const value = Number($(`input[data-key=${key}]`, panel).value);
+      if (!Number.isInteger(value) || value < 0 || value > 100000) return toast('Enter a number of MB from 0 to 100,000', 'error');
+      if (await adminAction(() => api.admin.setStorageSetting(key, value), `Saved — ${value} MB`)) refreshAccount();
+    });
     $('.limit-inline button', panel).addEventListener('click', async () => {
       const value = Number($('.limit-inline input', panel).value);
       if (!Number.isInteger(value) || value < 0 || value > 10000) return toast('Enter a number from 0 to 10,000', 'error');
@@ -2458,6 +3161,7 @@ select id from auth.users where email = 'them@example.com';</code></pre>
           <span class="menu-who"><small>Signed in as</small><strong>${esc(email)}</strong></span>
         </div>
         <a role="menuitem" href="#/mine">${icon('tray')}<span>My Pastes</span></a>
+        <a role="menuitem" href="#/files">${icon('folder')}<span>My Files</span></a>
         <a role="menuitem" href="#/">${icon('plus')}<span>New Paste</span></a>
         ${account?.is_admin ? `<a role="menuitem" href="#/admin">${icon('gauge')}<span>Admin</span></a>` : ''}
         <button role="menuitem" type="button" data-act="signout">${icon('logout')}<span>Sign Out</span></button>
@@ -2511,6 +3215,8 @@ select id from auth.users where email = 'them@example.com';</code></pre>
     if (first === 'mine') return { name: 'mine' };
     if (first === 'admin') return { name: 'admin', tab: ADMIN_TABS.some(([k]) => k === second) ? second : 'reports' };
     if (first === 'edit' && second) return { name: 'edit', id: second };
+    if (first === 'files') return { name: 'files' };
+    if (first === 'f' && second) return { name: 'file', id: second };
     return { name: 'paste', id: first };
   }
 
@@ -2563,6 +3269,15 @@ select id from auth.users where email = 'them@example.com';</code></pre>
             });
           }
         }
+      } else if (route.name === 'files') {
+        if (!hasCrypto) page = emptyState('warn', 'Encryption unavailable', 'Open QuickPaste over HTTPS to upload files.', false);
+        else if (!currentUser) page = viewFiles(null);
+        else if (!vaultKey) page = viewUnlockVault(async () => viewFiles(await loadMyFiles()));
+        else page = viewFiles(await loadMyFiles());
+      } else if (route.name === 'file') {
+        const f = hasCrypto && LINK_RE.test(normLink(route.id)) ? await openFile(route.id) : null;
+        page = f ? viewFile(f)
+          : emptyState('question', 'File not found', 'This file doesn’t exist, has expired, or its owner hasn’t shared it.', false);
       } else if (route.name === 'admin') {
         if (!currentUser) page = viewAuth({ returnTo: location.hash, note: 'Sign in with an admin account.' });
         else if (!account?.is_admin) page = emptyState('lock', 'Admins only', 'Your account doesn’t have access to the admin dashboard.', true);
