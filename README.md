@@ -8,6 +8,7 @@ A pastebin-style website with an Apple-inspired design. It's a static site (plai
 - **Options:** public, unlisted or private; expiration times; password protection; burn after reading
 - **Encryption:** every unlisted, private or password-protected paste is encrypted before it leaves your browser
 - **Accounts:** custom links (5 per account by default), private pastes, and **My Pastes**, where you can open, share, edit or delete everything you created
+- **Files:** a small encrypted cloud. Signed-in users get 25 MB (admins 50 MB) of private storage and share a file by turning on its link. Guests can share files up to 5 MB that always expire.
 - **Reports and admin:** anyone can report a paste. Admins get a dashboard for reports, pastes, users and custom-link limits.
 - Automatic light and dark mode, and a layout that works on phones
 
@@ -31,6 +32,10 @@ With a paste password, a second PBKDF2 (600,000 rounds) over the password produc
 | Any paste with a password | encrypted | only people with the link **and** the password |
 | Public, no password | readable | everyone, because it's listed in Recent |
 | Created before encryption | readable | as before. Duplicate it to get an encrypted copy. |
+| File (yours, sharing off) | encrypted | only you, while signed in |
+| File (sharing on, or a guest upload) | encrypted | only people with the link |
+
+**Files** use the same scheme: a random 12-character link becomes the lookup id and the AES-256-GCM key. The file's bytes, name and type are encrypted before upload. Supabase Storage holds only scrambled bytes, and the database knows only the size, owner and dates.
 
 **My Pastes.** Your links are stored encrypted with a random "vault" key. That vault key is itself encrypted with your account password (600,000 rounds of PBKDF2) inside your browser. On a new device you type your password once to unlock the list.
 
@@ -86,7 +91,18 @@ Refresh the site, and an **Admin** link appears in the top bar (on phones it's i
 - **Reports:** review reported pastes, make them private, delete them, or resolve or dismiss the report
 - **Pastes:** search all pastes, change their visibility, or delete them. Encrypted pastes show only metadata.
 - **Users:** see accounts, set a personal custom-link limit, reset it to the default, or delete a user along with all of their pastes
-- **Settings:** change the default custom-link limit for everyone (starts at 5)
+- **Files:** see every file's size, owner, sharing and expiry (never names or contents), delete files, and **Clean up**, which removes expired files and abandoned uploads from Storage. Run it now and then, because expired files still take up space until cleaned.
+- **Settings:** change the default custom-link limit (starts at 5) and the storage limits: registered users 25 MB, admins 50 MB, and a 200 MB pool shared by all guest uploads. Personal storage limits are set under **Users**.
+
+## File storage
+
+`schema.sql` creates everything automatically: two private Storage buckets (`files` allows up to 25 MB per file, `guest-files` up to 5 MB) and the access rules.
+
+- **Signed-in users:** files are private until the owner turns on sharing. Uploads are refused once the account's total (25 MB, or 50 MB for admins) is reached.
+- **Guests:** files are always shared by link and must expire (1 hour, 1 day or 1 week). Guests have no account, so their limit is per file (5 MB), plus the shared guest pool so anonymous uploads can't fill your project.
+- **Supabase free plan:** 1 GB of storage in total and 50 MB per file. Keep user limits × number of users, plus the guest pool, within that.
+- **Deleting a user** from the admin dashboard removes their files from Storage too.
+- **Limit accuracy:** limits are measured from Storage itself. One upload can go past a limit by at most one file, because the check runs before the file lands.
 
 To remove an admin: `delete from public.admins where user_id = (select id from auth.users where email = 'them@example.com');`
 
