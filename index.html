@@ -13,14 +13,20 @@
 <body>
   <header class="nav">
     <div class="nav-inner">
-      <a class="brand" href="#/" aria-label="QuickPaste home">
-        <img src="assets/icon.svg" alt="" width="26" height="26">
-        <span>QuickPaste</span>
-      </a>
-      <nav class="nav-links" aria-label="Main">
-        <a href="#/" data-nav="new">New</a>
-        <a href="#/recent" data-nav="recent">Recent</a>
-      </nav>
+      <div class="nav-left">
+        <a class="brand" href="#/" aria-label="QuickPaste home">
+          <img src="assets/icon.svg" alt="" width="26" height="26">
+          <span>QuickPaste</span>
+        </a>
+      </div>
+      <div class="nav-right">
+        <nav class="nav-links" aria-label="Main">
+          <a href="#/" data-nav="new">New</a>
+          <a href="#/recent" data-nav="recent">Recent</a>
+          <a href="#/mine" data-nav="mine" hidden>My Pastes</a>
+        </nav>
+        <div class="account" id="account"></div>
+      </div>
     </div>
     <div class="nav-progress" aria-hidden="true"></div>
   </header>
@@ -34,6 +40,7 @@
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js" defer></script>
   <script src="config.js"></script>
   <script src="assets/app.js" defer></script>
 </body>
