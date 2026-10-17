@@ -16,6 +16,18 @@
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
+  // Encryption ("the link is the key"): see supabase/schema.sql for the design.
+  const LINK_ITERATIONS = 300000;     // PBKDF2-SHA256 over the link
+  const PASSWORD_ITERATIONS = 600000; // PBKDF2-SHA256 over a paste password (OWASP 2023)
+  const VAULT_ITERATIONS = 600000;    // PBKDF2-SHA256 over the account password
+  const LINK_RE = /^[a-z0-9][a-z0-9_-]{2,39}$/;
+  const RESERVED_LINKS = new Set(['new', 'recent', 'login', 'mine', 'edit', 'admin', 'about', 'api', 'raw',
+    'help', 'settings', 'account', 'report', 'privacy', 'terms', 'p']);
+  const ID_ALPHABET = 'abcdefghijkmnpqrstuvwxyz23456789'; // 32 symbols → 5 bits each, no bias
+  const ID_LENGTH = 12;                                    // 60 random bits
+  const LOOKUP_RE = /^[0-9a-f]{64}$/;
+  const hasCrypto = !!(window.crypto && crypto.subtle);
+
   const LANGUAGES = [
     ['auto', 'Auto-detect'], ['plaintext', 'Plain Text'], ['bash', 'Bash'], ['c', 'C'],
     ['cpp', 'C++'], ['csharp', 'C#'], ['css', 'CSS'], ['diff', 'Diff'], ['go', 'Go'],
@@ -51,6 +63,19 @@
     ['', 'Never'], ['600', '10 Minutes'], ['3600', '1 Hour'], ['86400', '1 Day'],
     ['604800', '1 Week'], ['2592000', '1 Month'],
   ];
+  const VISIBILITY = {
+    public: { label: 'Public', icon: 'globe' },
+    unlisted: { label: 'Unlisted', icon: 'link' },
+    private: { label: 'Private', icon: 'lock' },
+  };
+  const REPORT_REASONS = [
+    ['spam', 'Spam or advertising'],
+    ['malware', 'Malware or phishing'],
+    ['illegal', 'Illegal content'],
+    ['personal', 'Someone’s personal information'],
+    ['other', 'Something else'],
+  ];
+  const REASON_NAME = Object.fromEntries(REPORT_REASONS);
 
   // SF Symbols–style line icons
   const ICONS = {
@@ -63,12 +88,15 @@
     pencil: '<path d="M4 20h4L19.3 8.7a2.8 2.8 0 0 0-4-4L4 16z"/><path d="m13.5 6.5 4 4"/>',
     trash: '<path d="M4.5 6.5h15M9.5 6.5V4.8c0-.7.6-1.3 1.3-1.3h2.4c.7 0 1.3.6 1.3 1.3v1.7M6.5 6.5l.8 12.2a2 2 0 0 0 2 1.8h5.4a2 2 0 0 0 2-1.8l.8-12.2M10 10.5v6M14 10.5v6"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+    x: '<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>',
     warn: '<path d="M12 4 2.8 19.5h18.4z"/><path d="M12 10v4M12 17h.01"/>',
     flame: '<path d="M12 21c-3.9 0-7-2.7-7-6.4 0-2.7 1.5-4.7 3.1-6.1.3 1.6 1 2.8 2.2 3.4C10.1 8.5 11.7 5.3 14 3c.3 3 1.6 4.6 3 6.2 1.3 1.5 2 3.1 2 5.3 0 3.8-3.1 6.5-7 6.5z"/>',
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
     eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>',
     globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.5 3.5 5.3 3.5 8.5s-1.1 6-3.5 8.5c-2.4-2.5-3.5-5.3-3.5-8.5s1.1-6 3.5-8.5z"/>',
     lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/>',
+    unlock: '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 7.6-1.7"/>',
+    shield: '<path d="M12 3.5 5 6v5.5c0 4.4 3 7.9 7 9 4-1.1 7-4.6 7-9V6z"/><path d="m9 12 2.2 2.2L15.5 10"/>',
     timer: '<circle cx="12" cy="13" r="7.5"/><path d="M12 9.5V13l2.5 1.5M10 2.5h4"/>',
     lines: '<path d="M4 7h16M4 12h16M4 17h10"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
@@ -78,6 +106,9 @@
     mail: '<rect x="3.5" y="5.5" width="17" height="13" rx="2.5"/><path d="m4.5 7 7.5 6 7.5-6"/>',
     logout: '<path d="M14 4.5H7a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h7"/><path d="M10.5 12h10M17 8.5l3.5 3.5-3.5 3.5"/>',
     person: '<circle cx="12" cy="8.5" r="3.8"/><path d="M4.8 20c.8-3.6 3.7-5.6 7.2-5.6s6.4 2 7.2 5.6"/>',
+    users: '<circle cx="9" cy="8.5" r="3.3"/><path d="M3 19.5c.6-3.2 3-5 6-5s5.4 1.8 6 5"/><path d="M15.5 5.6a3.3 3.3 0 0 1 0 5.8M17.5 14.7c1.8.6 3 2.3 3.5 4.8"/>',
+    flag: '<path d="M5.5 21V4.5M5.5 4.5h11l-2 4 2 4h-11"/>',
+    gauge: '<path d="M4.5 17.5a8.5 8.5 0 1 1 15 0"/><path d="m12 13 3.5-4"/>',
   };
   const icon = (name) => `<svg class="i" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -104,6 +135,7 @@
   const lineCount = (s) => (s ? s.split('\n').length : 1);
   const plural = (n, word) => `${Number(n).toLocaleString()} ${word}${Number(n) === 1 ? '' : 's'}`;
   const isExpired = (p) => !!p.expires_at && new Date(p.expires_at) <= new Date();
+  const isLegacyRow = (rowId) => !LOOKUP_RE.test(rowId || '');
 
   const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' }); // match the English UI
   function relativeTime(date) {
@@ -114,12 +146,6 @@
       if (Math.abs(diff) >= secs * 0.99) return rtf.format(Math.round(diff / secs), unit);
     }
     return diff > 0 ? 'in a moment' : 'just now';
-  }
-
-  function randomId(len = 10) {
-    const alphabet = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    const bytes = crypto.getRandomValues(new Uint8Array(len));
-    return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join('');
   }
 
   async function copyText(text) {
@@ -137,17 +163,10 @@
     }
   }
 
-  // Demo mode only — real passwords are handled by Supabase / bcrypt in Postgres.
-  async function sha256(text) {
-    if (!crypto.subtle) return text;
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  const pasteUrl = (id) => `${location.origin}${location.pathname}#/${id}`;
+  const pasteUrl = (link) => `${location.origin}${location.pathname}#/${link}`;
 
   async function sharePaste(p) {
-    const url = pasteUrl(p.id);
+    const url = pasteUrl(p.link ?? p.id);
     if (navigator.share) {
       try {
         await navigator.share({ title: p.title || 'QuickPaste', url });
@@ -171,11 +190,108 @@
     el.classList.add('shake');
   }
 
-  function langBadge(lang) {
+  function langBadge(lang, locked = false) {
+    if (locked) return `<span class="lang-badge" style="--c:#8e8e93">${icon('lock')}</span>`;
     const ext = (LANG_TO_EXT[lang] || 'txt').toUpperCase().slice(0, 4);
     const hash = [...(lang || 'plaintext')].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
     const color = lang && lang !== 'plaintext' ? BADGE_COLORS[hash % BADGE_COLORS.length] : '#8e8e93';
     return `<span class="lang-badge" style="--c:${color}">${esc(ext)}</span>`;
+  }
+
+  function codeBlock(content, lang) {
+    const lines = lineCount(content);
+    const el = html(`
+      <div class="code card">
+        <div class="code-gutter" aria-hidden="true"><pre></pre></div>
+        <div class="code-scroll"><pre><code class="hljs"></code></pre></div>
+      </div>`).firstElementChild;
+    $('.code-gutter pre', el).textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
+    const code = $('code', el);
+    if (window.hljs && lang !== 'plaintext' && hljs.getLanguage(lang) && content.length <= HIGHLIGHT_LIMIT) {
+      code.innerHTML = hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
+    } else {
+      code.textContent = content;
+    }
+    return el;
+  }
+
+  // ───────── Crypto ─────────
+
+  const te = new TextEncoder();
+  const td = new TextDecoder();
+  const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n));
+  const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  function concatBytes(...parts) {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let offset = 0;
+    for (const p of parts) { out.set(p, offset); offset += p.length; }
+    return out;
+  }
+  function toB64(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  function fromB64(str) {
+    const s = atob(str);
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+  }
+
+  // PBKDF2 (slow, resists guessing) → HKDF key from which independent values are expanded.
+  async function stretch(secret, salt, iterations) {
+    const base = await crypto.subtle.importKey('raw', te.encode(secret), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, 256);
+    return crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveBits']);
+  }
+  async function expand(master, label) {
+    const info = te.encode(label);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info }, master, 256));
+  }
+  async function aesKey(...parts) {
+    const material = parts.length === 1 ? parts[0] : new Uint8Array(await crypto.subtle.digest('SHA-256', concatBytes(...parts)));
+    return crypto.subtle.importKey('raw', material, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  }
+  async function seal(key, bytes, aad) {
+    const iv = randomBytes(12);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(aad) }, key, bytes);
+    return toB64(concatBytes(iv, new Uint8Array(ct)));
+  }
+  async function unseal(key, blob, aad) {
+    const bytes = fromB64(blob);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12), additionalData: te.encode(aad) }, key, bytes.slice(12));
+    return new Uint8Array(pt);
+  }
+  const sealJson = (key, obj, aad) => seal(key, te.encode(JSON.stringify(obj)), aad);
+  const unsealJson = async (key, blob, aad) => JSON.parse(td.decode(await unseal(key, blob, aad)));
+
+  // link → { lookup (stored as the row id), key (never leaves the browser) }
+  const linkCache = new Map();
+  function linkSecrets(link) {
+    if (!linkCache.has(link)) {
+      const job = (async () => {
+        const master = await stretch(link, te.encode('quickpaste/v2/link'), LINK_ITERATIONS);
+        return { lookup: toHex(await expand(master, 'lookup')), key: await expand(master, 'key') };
+      })();
+      job.catch(() => linkCache.delete(link));
+      linkCache.set(link, job);
+    }
+    return linkCache.get(link);
+  }
+  // paste password + per-paste salt → { auth (sent, bcrypt-hashed by the server), key (never sent) }
+  async function passwordSecrets(password, salt) {
+    const master = await stretch(password, concatBytes(te.encode('quickpaste/v2/password'), salt), PASSWORD_ITERATIONS);
+    return { auth: toHex(await expand(master, 'auth')), key: await expand(master, 'key') };
+  }
+
+  const normLink = (s) => String(s || '').trim().toLowerCase();
+  const newLink = () => Array.from(randomBytes(ID_LENGTH), (b) => ID_ALPHABET[b % ID_ALPHABET.length]).join('');
+  function linkProblem(link) {
+    if (link.length < 3) return 'At least 3 characters';
+    if (!LINK_RE.test(link)) return 'Letters, numbers, - and _ only';
+    if (RESERVED_LINKS.has(link)) return 'That word is reserved';
+    return null;
   }
 
   // ───────── Toasts & dialogs ─────────
@@ -191,43 +307,56 @@
     }, type === 'error' ? 4200 : 2600);
   }
 
+  // A sheet with arbitrary content. Returns { el, close }.
+  function openModal(contentHtml, { wide = false, onClose } = {}) {
+    const el = html(`
+      <div class="dialog-backdrop">
+        <div class="dialog ${wide ? 'wide' : ''}" role="dialog" aria-modal="true">${contentHtml}</div>
+      </div>`).firstElementChild;
+    const previous = document.activeElement;
+    document.body.appendChild(el);
+    document.body.classList.add('modal-open');
+    requestAnimationFrame(() => el.classList.add('open'));
+
+    let closed = false;
+    const close = (value) => {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener('keydown', onKey);
+      el.classList.remove('open');
+      setTimeout(() => {
+        el.remove();
+        if (!document.querySelector('.dialog-backdrop')) document.body.classList.remove('modal-open');
+      }, 260);
+      previous?.focus?.({ preventScroll: true });
+      onClose?.(value);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') close(false);
+      if (e.key === 'Tab') { // keep focus inside the dialog
+        const focusable = [...el.querySelectorAll('button, input, textarea, select, a[href]')].filter((n) => !n.disabled && n.offsetParent);
+        if (!focusable.length) return;
+        const i = focusable.indexOf(document.activeElement);
+        if (e.shiftKey && i <= 0) { e.preventDefault(); focusable[focusable.length - 1].focus(); }
+        if (!e.shiftKey && i === focusable.length - 1) { e.preventDefault(); focusable[0].focus(); }
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    el.addEventListener('click', (e) => { if (e.target === el) close(false); });
+    return { el, close };
+  }
+
   function confirmDialog({ title, message, confirmLabel = 'OK', destructive = false }) {
     return new Promise((resolve) => {
-      const el = html(`
-        <div class="dialog-backdrop">
-          <div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-msg">
-            <h2 id="dialog-title">${esc(title)}</h2>
-            <p id="dialog-msg">${esc(message)}</p>
-            <div class="dialog-actions">
-              <button class="btn" type="button" data-v="0">Cancel</button>
-              <button class="btn ${destructive ? 'destructive' : 'primary'}" type="button" data-v="1">${esc(confirmLabel)}</button>
-            </div>
-          </div>
-        </div>`).firstElementChild;
-      const previous = document.activeElement;
-      document.body.appendChild(el);
-      requestAnimationFrame(() => el.classList.add('open'));
+      const { el, close } = openModal(`
+        <h2>${esc(title)}</h2>
+        <p>${esc(message)}</p>
+        <div class="dialog-actions">
+          <button class="btn" type="button" data-v="0">Cancel</button>
+          <button class="btn ${destructive ? 'destructive' : 'primary'}" type="button" data-v="1">${esc(confirmLabel)}</button>
+        </div>`, { onClose: (v) => resolve(v === true) });
       $('[data-v="0"]', el).focus();
-
-      const close = (value) => {
-        document.removeEventListener('keydown', onKey);
-        el.classList.remove('open');
-        setTimeout(() => el.remove(), 260);
-        previous?.focus?.({ preventScroll: true });
-        resolve(value);
-      };
-      const onKey = (e) => {
-        if (e.key === 'Escape') close(false);
-        if (e.key === 'Tab') { // keep focus inside the dialog
-          const buttons = [...el.querySelectorAll('button')];
-          const i = buttons.indexOf(document.activeElement);
-          e.preventDefault();
-          buttons[(i + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
-        }
-      };
-      document.addEventListener('keydown', onKey);
       el.addEventListener('click', (e) => {
-        if (e.target === el) return close(false);
         const b = e.target.closest('[data-v]');
         if (b) close(b.dataset.v === '1');
       });
@@ -235,8 +364,8 @@
   }
 
   // ───────── Backends ─────────
-  // Both expose the same interface: pastes (create/get/getOwn/recent/mine/update/remove)
-  // and auth (init/signIn/signUp/signOut).
+  // Both expose the same interface; the Supabase one calls the SQL functions in
+  // supabase/schema.sql, the demo one imitates them in this browser.
 
   function friendlyError(message = '') {
     if (/failed to fetch|networkerror|load failed/i.test(message)) return 'Can’t reach the server. Check your connection.';
@@ -244,6 +373,7 @@
     if (/email not confirmed/i.test(message)) return 'Confirm your email first — check your inbox';
     if (/already registered|already exists/i.test(message)) return 'An account with this email already exists';
     if (/rate limit/i.test(message)) return 'Too many attempts. Please wait a moment and try again.';
+    if (/could not find the function/i.test(message)) return 'The database needs updating — run supabase/schema.sql again';
     return message || 'Something went wrong';
   }
 
@@ -266,23 +396,46 @@
       if (error) throw new Error(friendlyError(error.message));
       return data;
     };
+    const bodyArgs = (b) => ({
+      p_id: b.id, p_public_slug: b.publicSlug, p_title: b.title, p_content: b.content, p_language: b.language,
+      p_enc: b.enc, p_enc_salt: b.encSalt, p_size: b.size, p_visibility: b.visibility,
+    });
 
     return {
-      create: (p) => rpc('create_paste', {
-        p_title: p.title, p_content: p.content, p_language: p.language,
-        p_visibility: p.visibility, p_expires_in: p.expiresIn, p_burn: p.burn,
-        p_password: p.password || null,
+      create: (b) => rpc('create_paste', {
+        ...bodyArgs(b), p_expires_in: b.expiresIn, p_burn: b.burn, p_auth: b.auth,
+        p_is_custom: b.isCustom, p_owner_note: b.ownerNote,
       }),
-      get: (id, password) => rpc('get_paste', { p_id: id, p_password: password || null }),
-      getOwn: (id) => rpc('get_own_paste', { p_id: id }),
+      get: (id, auth) => rpc('get_paste', { p_id: id, p_auth: auth || null }),
+      linkAvailable: (id) => rpc('link_available', { p_id: id }),
       recent: () => rpc('recent_pastes', { p_limit: 30 }),
+      report: (r) => rpc('report_paste', {
+        p_id: r.id, p_link: r.link, p_password: r.password || null, p_reason: r.reason, p_details: r.details || null,
+      }),
+      myAccount: () => rpc('my_account'),
+      getVault: () => rpc('get_vault'),
+      createVault: (wrapped, salt) => rpc('create_vault', { p_wrapped_key: wrapped, p_salt: salt }),
       mine: () => rpc('my_pastes'),
-      update: (id, p) => rpc('update_paste', {
-        p_id: id, p_title: p.title, p_content: p.content, p_language: p.language,
-        p_visibility: p.visibility, p_burn: p.burn, p_change_expiry: p.changeExpiry,
-        p_expires_in: p.expiresIn, p_password_mode: p.passwordMode, p_password: p.password || null,
+      getOwn: (id) => rpc('get_own_paste', { p_id: id }),
+      update: (b) => rpc('update_paste', {
+        ...bodyArgs(b), p_burn: b.burn, p_change_expiry: b.changeExpiry, p_expires_in: b.expiresIn,
+        p_password_mode: b.passwordMode, p_auth: b.auth, p_owner_note: b.ownerNote,
       }),
       remove: (id) => rpc('delete_paste', { p_id: id }),
+
+      admin: {
+        overview: () => rpc('admin_overview'),
+        reports: (status) => rpc('admin_reports', { p_status: status }),
+        setReportStatus: (id, status) => rpc('admin_set_report_status', { p_id: id, p_status: status }),
+        pastes: (query) => rpc('admin_pastes', { p_query: query || null, p_limit: 200, p_offset: 0 }),
+        getPaste: (id) => rpc('admin_get_paste', { p_id: id }),
+        setVisibility: (id, visibility) => rpc('admin_set_visibility', { p_id: id, p_visibility: visibility }),
+        deletePaste: (id) => rpc('admin_delete_paste', { p_id: id }),
+        users: (query) => rpc('admin_users', { p_query: query || null, p_limit: 200, p_offset: 0 }),
+        deleteUser: (id) => rpc('admin_delete_user', { p_user_id: id }),
+        setUserLimit: (id, limit) => rpc('admin_set_user_limit', { p_user_id: id, p_limit: limit }),
+        setDefaultLimit: (limit) => rpc('admin_set_default_limit', { p_limit: limit }),
+      },
 
       auth: {
         async init(onChange) {
@@ -328,103 +481,286 @@
   }
 
   // Used until config.js is filled in: everything lives in this browser only.
+  // The first account created becomes an admin so the dashboard can be tried out.
   function createDemoBackend() {
-    const PASTES = 'quickpaste:demo-pastes';
-    const USERS = 'quickpaste:demo-users';
-    const SESSION = 'quickpaste:demo-session';
+    const K = {
+      pastes: 'quickpaste:demo2-pastes', users: 'quickpaste:demo2-users', session: 'quickpaste:demo2-session',
+      admins: 'quickpaste:demo2-admins', settings: 'quickpaste:demo2-settings', limits: 'quickpaste:demo2-limits',
+      vaults: 'quickpaste:demo2-vaults', reports: 'quickpaste:demo2-reports',
+    };
     const read = (k, fallback) => { try { return JSON.parse(storage.get(k)) ?? fallback; } catch { return fallback; } };
     const write = (k, v) => storage.set(k, JSON.stringify(v));
-    let user = read(SESSION, null);
+    const hash = async (text) => toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(`demo:${text}`))));
+    let user = read(K.session, null);
     let notify = () => {};
-    const setUser = (u) => {
+    const setSession = (u) => {
       user = u;
-      if (u) write(SESSION, u); else storage.del(SESSION);
+      if (u) write(K.session, u); else storage.del(K.session);
       notify(u);
     };
 
-    const isOwner = (p) => !!user && p.owner_id === user.id;
+    const uid = () => user?.id ?? null;
+    const isAdmin = () => !!user && read(K.admins, []).includes(user.id);
+    const requireAdmin = () => { if (!isAdmin()) throw new Error('Admins only'); };
+    const defaultLimit = () => read(K.settings, { custom_link_limit: 5 }).custom_link_limit;
+    const linkLimit = (id) => read(K.limits, {})[id] ?? defaultLimit();
+    const usersById = () => Object.fromEntries(Object.values(read(K.users, {})).map((u) => [u.id, u]));
     const toJson = (p) => {
-      const { password_hash, owner_id, ...rest } = p;
-      return { ...rest, has_password: !!password_hash, is_owner: isOwner(p) };
+      const { password_hash, owner_id, owner_note, ...rest } = p;
+      return { ...rest, has_password: !!password_hash, is_owner: !!user && owner_id === user.id, encrypted: p.enc != null };
     };
     const expiry = (secs) => (secs ? new Date(Date.now() + secs * 1000).toISOString() : null);
-    const owned = (id) => {
-      const all = read(PASTES, {});
-      if (!user) throw new Error('Sign in to manage pastes');
-      if (!all[id] || !isOwner(all[id])) throw new Error('Paste not found');
-      return all;
+    const checkInput = (b) => {
+      if ((b.content == null) === (b.enc == null)) throw new Error('Send either plain or encrypted content');
+      if (!(b.size >= 1 && b.size <= MAX_CHARS)) throw new Error('Paste is too large (max 500 KB)');
+      if (!VISIBILITY[b.visibility]) throw new Error('Invalid visibility');
     };
 
     return {
-      async create(p) {
-        const all = read(PASTES, {});
-        const id = randomId();
-        all[id] = {
-          id, title: p.title, content: p.content, language: p.language, visibility: p.visibility,
-          burn_after_read: p.burn, views: 0, created_at: new Date().toISOString(), updated_at: null,
-          expires_at: expiry(p.expiresIn), password_hash: p.password ? await sha256(p.password) : null,
-          owner_id: user?.id ?? null,
+      async create(b) {
+        checkInput(b);
+        if (!LOOKUP_RE.test(b.id)) throw new Error('Invalid paste id');
+        if (b.content != null && (b.visibility !== 'public' || b.auth)) throw new Error('Only public pastes without a password can be stored unencrypted');
+        if (b.visibility === 'public' ? !LINK_RE.test(b.publicSlug || '') : b.publicSlug) throw new Error('Invalid link');
+        if (b.visibility === 'private' && !uid()) throw new Error('Sign in to create private pastes');
+        const all = read(K.pastes, {});
+        if (b.isCustom) {
+          if (!uid()) throw new Error('Sign in to choose a custom link');
+          const used = Object.values(all).filter((p) => p.owner_id === uid() && p.is_custom).length;
+          if (used >= linkLimit(uid())) throw new Error(`You’ve used all ${linkLimit(uid())} of your custom links`);
+        }
+        if (all[b.id] || (b.publicSlug && Object.values(all).some((p) => p.public_slug === b.publicSlug))) {
+          throw new Error('That link is already taken');
+        }
+        all[b.id] = {
+          id: b.id, public_slug: b.publicSlug, title: b.content == null ? '' : b.title, content: b.content,
+          language: b.content == null ? 'plaintext' : b.language, enc: b.enc, enc_salt: b.auth ? b.encSalt : null,
+          size: b.size, visibility: b.visibility, burn_after_read: !!b.burn, views: 0,
+          created_at: new Date().toISOString(), updated_at: null, expires_at: expiry(b.expiresIn),
+          password_hash: b.auth ? await hash(b.auth) : null, is_custom: !!b.isCustom,
+          owner_id: uid(), owner_note: uid() ? b.ownerNote : null,
         };
-        write(PASTES, all);
-        return id;
+        write(K.pastes, all);
+        return b.id;
       },
-      async get(id, password) {
-        const all = read(PASTES, {});
+      async get(id, auth) {
+        const all = read(K.pastes, {});
         const p = all[id];
         if (!p) return null;
-        if (isOwner(p)) return toJson(p);
-        if (isExpired(p)) return null;
-        if (p.password_hash) {
-          if (!password) return { id, locked: true, wrong_password: false };
-          if ((await sha256(password)) !== p.password_hash) return { id, locked: true, wrong_password: true };
+        if (p.owner_id && p.owner_id === uid()) return toJson(p);
+        if (p.visibility === 'private' || isExpired(p)) return null;
+        if (p.password_hash && (!auth || (await hash(auth)) !== p.password_hash)) {
+          return { id, locked: true, wrong_password: !!auth, enc_salt: p.enc_salt, encrypted: p.enc != null };
         }
         if (p.burn_after_read) delete all[id]; else p.views += 1;
-        write(PASTES, all);
+        write(K.pastes, all);
         return toJson(p);
       },
-      async getOwn(id) {
-        const p = read(PASTES, {})[id];
-        return p && isOwner(p) ? toJson(p) : null;
+      async linkAvailable(id) {
+        return !read(K.pastes, {})[id];
       },
       async recent() {
-        return Object.values(read(PASTES, {}))
+        return Object.values(read(K.pastes, {}))
           .filter((p) => !isExpired(p) && p.visibility === 'public' && !p.burn_after_read)
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
           .slice(0, 30)
           .map((p) => ({
-            id: p.id, title: p.title, language: p.language, created_at: p.created_at, size: p.content.length,
-            locked: !!p.password_hash, preview: p.password_hash ? null : p.content.slice(0, 400),
+            id: p.public_slug || p.id, title: p.enc ? null : p.title, language: p.enc ? null : p.language,
+            created_at: p.created_at, size: p.size, locked: !!(p.password_hash || p.enc),
+            preview: p.password_hash || p.enc ? null : p.content.slice(0, 400),
           }));
+      },
+      async report(r) {
+        if (!REASON_NAME[r.reason]) throw new Error('Choose a reason');
+        const reports = read(K.reports, []);
+        const exists = !!read(K.pastes, {})[r.id];
+        reports.push({
+          id: (reports.at(-1)?.id || 0) + 1, paste_id: exists ? r.id : null, link: r.link, password: r.password || null,
+          reason: r.reason, details: r.details || null, reporter_id: uid(), status: 'open',
+          created_at: new Date().toISOString(), resolved_at: null,
+        });
+        write(K.reports, reports);
+      },
+      async myAccount() {
+        if (!user) return null;
+        const used = Object.values(read(K.pastes, {})).filter((p) => p.owner_id === uid() && p.is_custom).length;
+        return { is_admin: isAdmin(), custom_used: used, custom_limit: linkLimit(uid()), has_vault: !!read(K.vaults, {})[uid()] };
+      },
+      async getVault() {
+        return read(K.vaults, {})[uid()] || null;
+      },
+      async createVault(wrapped, salt) {
+        const vaults = read(K.vaults, {});
+        if (vaults[uid()]) return false;
+        vaults[uid()] = { wrapped_key: wrapped, salt };
+        write(K.vaults, vaults);
+        return true;
       },
       async mine() {
         if (!user) return [];
-        return Object.values(read(PASTES, {}))
-          .filter(isOwner)
+        return Object.values(read(K.pastes, {}))
+          .filter((p) => p.owner_id === uid())
           .sort((a, b) => b.created_at.localeCompare(a.created_at))
-          .map((p) => {
-            const { content, password_hash, owner_id, ...rest } = p;
-            return { ...rest, size: content.length, has_password: !!password_hash, expired: isExpired(p) };
-          });
+          .map((p) => ({
+            id: p.id, public_slug: p.public_slug, owner_note: p.owner_note, is_custom: p.is_custom,
+            visibility: p.visibility, burn_after_read: p.burn_after_read, views: p.views, created_at: p.created_at,
+            updated_at: p.updated_at, expires_at: p.expires_at, title: p.enc ? null : p.title,
+            language: p.enc ? null : p.language, size: p.size, has_password: !!p.password_hash,
+            encrypted: p.enc != null, expired: isExpired(p),
+          }));
       },
-      async update(id, p) {
-        const all = owned(id);
-        const rec = all[id];
-        if (p.passwordMode === 'set' && !p.password) throw new Error('Enter a new password');
+      async getOwn(id) {
+        const p = read(K.pastes, {})[id];
+        return p && p.owner_id === uid() ? { ...toJson(p), owner_note: p.owner_note } : null;
+      },
+      async update(b) {
+        if (!uid()) throw new Error('Sign in to edit pastes');
+        const all = read(K.pastes, {});
+        const rec = all[b.id];
+        if (!rec || rec.owner_id !== uid()) throw new Error('Paste not found');
+        checkInput(b);
+        if (b.passwordMode === 'set' && !b.auth) throw new Error('Enter a new password');
+        const finalPw = b.passwordMode === 'set' ? true : b.passwordMode === 'remove' ? false : !!rec.password_hash;
+        if (b.content != null && (b.visibility !== 'public' || finalPw)) throw new Error('Only public pastes without a password can be stored unencrypted');
+        if (b.visibility === 'public' && !LINK_RE.test(b.publicSlug || '')) throw new Error('Invalid link');
         Object.assign(rec, {
-          title: p.title, content: p.content, language: p.language, visibility: p.visibility,
-          burn_after_read: p.burn, updated_at: new Date().toISOString(),
+          public_slug: b.visibility === 'public' ? b.publicSlug : null,
+          title: b.content == null ? '' : b.title, content: b.content,
+          language: b.content == null ? 'plaintext' : b.language, enc: b.enc,
+          enc_salt: finalPw && b.enc ? b.encSalt : null, size: b.size, visibility: b.visibility,
+          burn_after_read: !!b.burn, updated_at: new Date().toISOString(),
+          owner_note: b.ownerNote ?? rec.owner_note,
         });
-        if (p.changeExpiry) rec.expires_at = expiry(p.expiresIn);
-        if (p.passwordMode === 'set') rec.password_hash = await sha256(p.password);
-        if (p.passwordMode === 'remove') rec.password_hash = null;
-        write(PASTES, all);
+        if (b.changeExpiry) rec.expires_at = expiry(b.expiresIn);
+        if (b.passwordMode === 'set') rec.password_hash = await hash(b.auth);
+        if (b.passwordMode === 'remove') rec.password_hash = null;
+        write(K.pastes, all);
         return toJson(rec);
       },
       async remove(id) {
-        const all = owned(id);
+        const all = read(K.pastes, {});
+        if (!all[id] || all[id].owner_id !== uid()) return false;
         delete all[id];
-        write(PASTES, all);
+        write(K.pastes, all);
         return true;
+      },
+
+      admin: {
+        async overview() {
+          requireAdmin();
+          const pastes = Object.values(read(K.pastes, {}));
+          return {
+            pastes: pastes.length, encrypted: pastes.filter((p) => p.enc).length,
+            users: Object.keys(read(K.users, {})).length,
+            open_reports: read(K.reports, []).filter((r) => r.status === 'open').length,
+            default_limit: defaultLimit(),
+          };
+        },
+        async reports(status) {
+          requireAdmin();
+          const pastes = read(K.pastes, {});
+          const users = usersById();
+          return read(K.reports, [])
+            .filter((r) => status === 'all' || r.status === status)
+            .sort((a, b) => b.created_at.localeCompare(a.created_at))
+            .map((r) => {
+              const p = r.paste_id ? pastes[r.paste_id] : null;
+              return {
+                ...r, reporter_email: users[r.reporter_id]?.email || null, paste_exists: !!p,
+                visibility: p?.visibility, views: p?.views, encrypted: !!p?.enc,
+                title: p && !p.enc ? p.title : null, owner_email: users[p?.owner_id]?.email || null,
+              };
+            });
+        },
+        async setReportStatus(id, status) {
+          requireAdmin();
+          const reports = read(K.reports, []);
+          const r = reports.find((x) => x.id === id);
+          if (r) { r.status = status; r.resolved_at = status === 'open' ? null : new Date().toISOString(); }
+          write(K.reports, reports);
+        },
+        async pastes(query) {
+          requireAdmin();
+          const q = (query || '').trim().toLowerCase();
+          const users = usersById();
+          const reports = read(K.reports, []);
+          return Object.values(read(K.pastes, {}))
+            .filter((p) => !q || p.id === q || (p.public_slug || '').includes(q)
+              || (!p.enc && (p.title || '').toLowerCase().includes(q))
+              || (users[p.owner_id]?.email || '').toLowerCase().includes(q))
+            .sort((a, b) => b.created_at.localeCompare(a.created_at))
+            .map((p) => ({
+              id: p.id, public_slug: p.public_slug, visibility: p.visibility, burn_after_read: p.burn_after_read,
+              views: p.views, created_at: p.created_at, expires_at: p.expires_at, title: p.enc ? null : p.title,
+              language: p.enc ? null : p.language, size: p.size, encrypted: !!p.enc, has_password: !!p.password_hash,
+              is_custom: p.is_custom, expired: isExpired(p), owner_email: users[p.owner_id]?.email || null,
+              open_reports: reports.filter((r) => r.paste_id === p.id && r.status === 'open').length,
+            }));
+        },
+        async getPaste(id) {
+          requireAdmin();
+          const p = read(K.pastes, {})[id];
+          return p ? toJson(p) : null;
+        },
+        async setVisibility(id, visibility) {
+          requireAdmin();
+          const all = read(K.pastes, {});
+          const p = all[id];
+          if (!p) throw new Error('Paste not found');
+          if (visibility === 'public' && !p.public_slug && LOOKUP_RE.test(p.id)) {
+            throw new Error('This paste’s link is secret, so it can’t be listed publicly');
+          }
+          p.visibility = visibility;
+          write(K.pastes, all);
+        },
+        async deletePaste(id) {
+          requireAdmin();
+          const all = read(K.pastes, {});
+          delete all[id];
+          write(K.pastes, all);
+          const reports = read(K.reports, []);
+          reports.forEach((r) => { if (r.paste_id === id) r.paste_id = null; });
+          write(K.reports, reports);
+          return true;
+        },
+        async users(query) {
+          requireAdmin();
+          const q = (query || '').trim().toLowerCase();
+          const pastes = Object.values(read(K.pastes, {}));
+          const admins = read(K.admins, []);
+          const limits = read(K.limits, {});
+          return Object.values(read(K.users, {}))
+            .filter((u) => !q || u.email.toLowerCase().includes(q))
+            .sort((a, b) => b.created_at.localeCompare(a.created_at))
+            .map((u) => ({
+              id: u.id, email: u.email, created_at: u.created_at, last_sign_in_at: u.last_sign_in_at,
+              pastes: pastes.filter((p) => p.owner_id === u.id).length,
+              custom_used: pastes.filter((p) => p.owner_id === u.id && p.is_custom).length,
+              custom_limit_override: limits[u.id] ?? null, custom_limit: linkLimit(u.id),
+              is_admin: admins.includes(u.id), is_me: u.id === uid(),
+            }));
+        },
+        async deleteUser(id) {
+          requireAdmin();
+          if (id === uid()) throw new Error('You can’t delete your own account here');
+          if (read(K.admins, []).includes(id)) throw new Error('Remove their admin rights first');
+          const users = read(K.users, {});
+          for (const [key, u] of Object.entries(users)) if (u.id === id) delete users[key];
+          write(K.users, users);
+          const all = read(K.pastes, {});
+          for (const [key, p] of Object.entries(all)) if (p.owner_id === id) delete all[key];
+          write(K.pastes, all);
+        },
+        async setUserLimit(id, limit) {
+          requireAdmin();
+          const limits = read(K.limits, {});
+          if (limit == null) delete limits[id]; else limits[id] = limit;
+          write(K.limits, limits);
+        },
+        async setDefaultLimit(limit) {
+          requireAdmin();
+          write(K.settings, { custom_link_limit: limit });
+        },
       },
 
       auth: {
@@ -433,24 +769,30 @@
           return { user, notice: null };
         },
         async signIn(email, password) {
-          const u = read(USERS, {})[email.toLowerCase()];
-          if (!u || u.hash !== (await sha256(password))) throw new Error('Incorrect email or password');
+          const users = read(K.users, {});
+          const u = users[email.toLowerCase()];
+          if (!u || u.hash !== (await hash(password))) throw new Error('Incorrect email or password');
+          u.last_sign_in_at = new Date().toISOString();
+          write(K.users, users);
           const session = { id: u.id, email: u.email };
-          setUser(session);
+          setSession(session);
           return session;
         },
         async signUp(email, password) {
-          const users = read(USERS, {});
+          const users = read(K.users, {});
           const key = email.toLowerCase();
           if (users[key]) throw new Error('An account with this email already exists');
-          users[key] = { id: crypto.randomUUID?.() || randomId(24), email, hash: await sha256(password) };
-          write(USERS, users);
-          const session = { id: users[key].id, email };
-          setUser(session);
+          const id = crypto.randomUUID?.() || toHex(randomBytes(16));
+          const now = new Date().toISOString();
+          users[key] = { id, email, hash: await hash(password), created_at: now, last_sign_in_at: now };
+          if (!Object.keys(users).some((k) => k !== key)) write(K.admins, [id]); // first account → admin
+          write(K.users, users);
+          const session = { id, email };
+          setSession(session);
           return { user: session, needsConfirmation: false };
         },
         async signOut() {
-          setUser(null);
+          setSession(null);
         },
       },
     };
@@ -462,21 +804,252 @@
   // ───────── State ─────────
 
   let currentUser = null;
+  let account = null;   // { is_admin, custom_used, custom_limit, has_vault }
+  let vaultKey = null;  // AES key that encrypts this user's list of links (owner_note)
   let booted = false;
-  // Pastes seen this session — lets a creator view a burn-after-read paste
-  // without destroying it, and avoids re-fetching on back/forward.
+  // Pastes opened this session, by link — lets a creator view a burn-after-read
+  // paste without destroying it, and avoids re-fetching on back/forward.
   const cache = new Map();
   let prefill = null;
 
-  function setUser(user) {
-    const changed = (user?.id ?? null) !== (currentUser?.id ?? null);
+  async function setUser(user) {
+    const previous = currentUser;
+    const changed = (user?.id ?? null) !== (previous?.id ?? null);
     currentUser = user;
+    if (changed) {
+      cache.clear();
+      if (previous) storage.del(vaultSlot(previous.id));
+      vaultKey = null;
+      account = null;
+      if (user) {
+        await restoreVault(user.id);
+        await refreshAccount();
+      }
+    }
     renderAccount();
-    if (!changed) return;
-    cache.clear();
-    // Pages that depend on who is signed in get re-rendered.
-    if (booted && ['mine', 'edit'].includes(parseRoute().name)) navigate();
+    if (changed && booted && ['mine', 'edit', 'admin'].includes(parseRoute().name)) navigate();
   }
+
+  async function refreshAccount() {
+    account = currentUser ? await api.myAccount().catch(() => null) : null;
+    renderAccount();
+  }
+
+  // ───────── Vault: the user's links, encrypted with a key only they can unwrap ─────────
+
+  const vaultSlot = (uid) => `quickpaste:vault:${uid}`;
+  const vaultWrapKey = async (password, salt) => aesKey(await expand(await stretch(password, salt, VAULT_ITERATIONS), 'vault'));
+
+  async function restoreVault(uid) {
+    vaultKey = null;
+    const raw = storage.get(vaultSlot(uid));
+    if (raw && hasCrypto) {
+      try { vaultKey = await aesKey(fromB64(raw)); } catch { /* corrupt — ask for the password again */ }
+    }
+  }
+
+  // Unwraps the vault with the account password (creating it on first use).
+  async function unlockVault(password) {
+    const uid = currentUser.id;
+    let vault = await api.getVault();
+    let raw;
+    if (!vault) {
+      raw = randomBytes(32);
+      const salt = randomBytes(16);
+      const wrapped = await seal(await vaultWrapKey(password, salt), raw, `vault:${uid}`);
+      if (!(await api.createVault(wrapped, toB64(salt)))) vault = await api.getVault(); // created elsewhere meanwhile
+    }
+    if (vault) {
+      try {
+        raw = await unseal(await vaultWrapKey(password, fromB64(vault.salt)), vault.wrapped_key, `vault:${uid}`);
+      } catch {
+        throw new Error('Incorrect password');
+      }
+    }
+    storage.set(vaultSlot(uid), toB64(raw));
+    vaultKey = await aesKey(raw);
+  }
+
+  const sealNote = async (note) => (currentUser && vaultKey ? sealJson(vaultKey, note, `note:${currentUser.id}`) : null);
+  async function openNote(blob) {
+    if (!blob || !vaultKey || !currentUser) return null;
+    try { return await unsealJson(vaultKey, blob, `note:${currentUser.id}`); } catch { return null; }
+  }
+
+  // ───────── Paste service ─────────
+
+  const needPassword = () => Object.assign(new Error('Password required'), { needPassword: true });
+
+  // Server row → paste for the UI. `link` is what appears after #/.
+  async function decodeRow(row, link, password = null) {
+    const base = { ...row, id: link, link, rowId: row.id, password: password || null };
+    delete base.enc;
+    if (!row.encrypted) return { ...base, encrypted: false };
+    const { key } = await linkSecrets(link);
+    let pwKey = null;
+    if (row.has_password) {
+      if (!password) throw needPassword();
+      pwKey = (await passwordSecrets(password, fromB64(row.enc_salt))).key;
+    }
+    let body;
+    try {
+      body = await unsealJson(await aesKey(...(pwKey ? [key, pwKey] : [key])), row.enc, row.id);
+    } catch {
+      throw new Error(password ? 'Incorrect password' : 'This paste couldn’t be decrypted');
+    }
+    return { ...base, encrypted: true, title: body.title || '', content: body.content, language: body.language || 'plaintext' };
+  }
+
+  // Resolve a link from the address bar:
+  //   { status: 'ok', paste } | { status: 'locked', … } | { status: 'missing' }
+  async function openLink(raw, password = null, locked = null) {
+    const link = normLink(raw);
+
+    const tryEncrypted = async () => {
+      if (!hasCrypto || !LINK_RE.test(link)) return null;
+      const { lookup } = await linkSecrets(link);
+      const auth = password && locked?.encSalt ? (await passwordSecrets(password, fromB64(locked.encSalt))).auth : null;
+      const row = await api.get(lookup, auth);
+      if (!row) return null;
+      if (row.locked) return { status: 'locked', kind: 'new', link, rowId: lookup, encSalt: row.enc_salt, wrong: row.wrong_password };
+      try {
+        return { status: 'ok', paste: await decodeRow(row, link, password) };
+      } catch (err) {
+        if (!err.needPassword) throw err;
+        // An owner opening their own password paste: the password is in their vault note.
+        const note = row.is_owner ? await openNote((await api.getOwn(row.id).catch(() => null))?.owner_note) : null;
+        if (note?.password) return { status: 'ok', paste: await decodeRow(row, link, note.password) };
+        return { status: 'locked', kind: 'owner', link, rowId: row.id, ownerRow: row };
+      }
+    };
+    // Pastes from before encryption: short id, checked by the server as-is.
+    const tryOlder = async () => {
+      const row = await api.get(raw, password);
+      if (!row) return null;
+      if (row.locked) return { status: 'locked', kind: 'old', link: raw, rowId: raw, wrong: row.wrong_password };
+      return { status: 'ok', paste: { ...row, id: raw, link: raw, rowId: raw, encrypted: false, password } };
+    };
+
+    if (locked) return (await (locked.kind === 'old' ? tryOlder() : tryEncrypted())) || { status: 'missing' };
+    const order = /[A-Z]/.test(raw) ? [tryOlder, tryEncrypted] : [tryEncrypted, tryOlder];
+    for (const attempt of order) {
+      const result = await attempt();
+      if (result) return result;
+    }
+    return { status: 'missing' };
+  }
+
+  // Encrypt (or, for public pastes without a password, don't) for storage.
+  async function buildBody(link, input, keepSalt = null) {
+    const { lookup, key } = await linkSecrets(link);
+    const plain = input.visibility === 'public' && !input.password;
+    const body = {
+      id: lookup, publicSlug: input.visibility === 'public' ? link : null, size: input.content.length,
+      visibility: input.visibility, title: null, content: null, language: null, enc: null, encSalt: null, auth: null,
+    };
+    if (plain) {
+      Object.assign(body, { title: input.title, content: input.content, language: input.language });
+    } else {
+      let pwKey = null;
+      if (input.password) {
+        const salt = keepSalt ? fromB64(keepSalt) : randomBytes(16);
+        const secrets = await passwordSecrets(input.password, salt);
+        Object.assign(body, { encSalt: toB64(salt), auth: secrets.auth });
+        pwKey = secrets.key;
+      }
+      const payload = { title: input.title, content: input.content, language: input.language };
+      body.enc = await sealJson(await aesKey(...(pwKey ? [key, pwKey] : [key])), payload, lookup);
+    }
+    body.ownerNote = await sealNote({ link, title: input.title, language: input.language, password: input.password || null });
+    return body;
+  }
+
+  async function createPaste(input) {
+    const custom = !!input.customLink;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const link = custom ? normLink(input.customLink) : newLink();
+      const body = await buildBody(link, input);
+      try {
+        await api.create({ ...body, expiresIn: input.expiresIn, burn: input.burn, isCustom: custom });
+        return { link, body };
+      } catch (err) {
+        if (!custom && /already taken/i.test(err.message)) continue; // astronomically unlikely
+        throw err;
+      }
+    }
+    throw new Error('Couldn’t create a unique link — please try again');
+  }
+
+  // existing: decrypted paste; input: new values; returns the saved paste for the UI.
+  async function savePaste(existing, input) {
+    const { passwordMode } = input;
+    let finalPassword = passwordMode === 'set' ? input.password : passwordMode === 'remove' ? null : existing.password;
+    let row;
+    if (isLegacyRow(existing.rowId)) {
+      // Older pastes keep their short, server-known id, so they stay unencrypted.
+      finalPassword = null;
+      row = await api.update({
+        id: existing.rowId, publicSlug: null, title: input.title, content: input.content, language: input.language,
+        enc: null, encSalt: null, size: input.content.length, visibility: input.visibility, burn: input.burn,
+        changeExpiry: input.changeExpiry, expiresIn: input.expiresIn, passwordMode,
+        auth: passwordMode === 'set' ? input.password : null, ownerNote: null,
+      });
+    } else {
+      if (passwordMode === 'keep' && existing.has_password && !existing.password) throw new Error('Unlock this paste first');
+      const body = await buildBody(existing.link, { ...input, password: finalPassword }, passwordMode === 'keep' ? existing.enc_salt : null);
+      row = await api.update({
+        ...body, burn: input.burn, changeExpiry: input.changeExpiry, expiresIn: input.expiresIn, passwordMode,
+        auth: passwordMode === 'set' ? body.auth : null,
+      });
+    }
+    const saved = {
+      ...row, id: existing.link, link: existing.link, rowId: existing.rowId, is_owner: true,
+      title: input.title, content: input.content, language: input.language, password: finalPassword,
+    };
+    delete saved.enc;
+    return saved;
+  }
+
+  async function loadMine() {
+    const rows = (await api.mine()) || [];
+    return Promise.all(rows.map(async (r) => {
+      const legacy = isLegacyRow(r.id);
+      const note = legacy ? null : await openNote(r.owner_note);
+      return {
+        ...r, rowId: r.id, legacy,
+        link: legacy ? r.id : note?.link || r.public_slug || null,
+        title: note?.title ?? r.title ?? '',
+        language: note?.language || r.language || 'plaintext',
+        password: note?.password || null,
+      };
+    }));
+  }
+
+  // For the editor: your own paste by link, decrypted. Throws needPassword if the
+  // password isn't in your vault.
+  async function loadOwn(raw) {
+    const link = normLink(raw);
+    let row = null;
+    let viaLink = raw;
+    if (hasCrypto && LINK_RE.test(link) && !/[A-Z]/.test(raw)) {
+      row = await api.getOwn((await linkSecrets(link)).lookup);
+      viaLink = link;
+    }
+    if (!row) {
+      row = await api.getOwn(raw);
+      viaLink = raw;
+    }
+    if (!row) return null;
+    const note = await openNote(row.owner_note);
+    try {
+      return await decodeRow(row, viaLink, note?.password || null);
+    } catch (err) {
+      if (err.needPassword) Object.assign(err, { row, link: viaLink });
+      throw err;
+    }
+  }
+
+  // ───────── Language detection ─────────
 
   // highlight.js's relevance scoring is unreliable on short snippets (e.g. it
   // calls `const x = "a"; console.log(x)` C++), so clear signatures win first,
@@ -528,6 +1101,7 @@
 
   function viewComposer(existing = null) {
     const editing = !!existing;
+    const legacy = editing && isLegacyRow(existing.rowId);
     const draft = editing ? {
       title: existing.title, content: existing.content,
       language: LANG_NAME[existing.language] ? existing.language : 'plaintext',
@@ -542,24 +1116,39 @@
       expOptions = `<option value="keep">Keep · ${esc(current)}</option>${expOptions}`;
     }
 
+    const linkLeft = account ? Math.max(0, account.custom_limit - account.custom_used) : 0;
+    const customRow = editing ? '' : `
+      <div class="row link-row">
+        <div class="row-label">
+          <span class="row-icon" style="background:#ff2d55">${icon('link')}</span>
+          <span class="row-text">Custom link<small class="link-hint"></small></span>
+        </div>
+        <div class="link-field">
+          <span class="link-prefix">#/</span>
+          <input name="custom" placeholder="random" maxlength="40" autocomplete="off" autocapitalize="off" spellcheck="false"
+            aria-label="Custom link" ${!currentUser || !linkLeft ? 'disabled' : ''}>
+          <span class="link-status" aria-hidden="true"></span>
+        </div>
+      </div>`;
+
     const header = editing
       ? `<header class="page-head">
            <p class="eyebrow reveal">Editing</p>
            <h1 class="reveal" style="--d:1">${esc(existing.title || 'Untitled')}</h1>
-           <p class="reveal" style="--d:1">Changes are saved to the same link.</p>
+           <p class="reveal" style="--d:1">Changes are saved to the same link: <a href="#/${esc(existing.link)}">#/${esc(existing.link)}</a></p>
          </header>`
       : `<section class="hero">
            <h1 class="reveal">Paste it. <span class="gradient-text">Share it.</span></h1>
-           <p class="reveal" style="--d:1">Drop in code or text and get a clean, shareable link in seconds.</p>
+           <p class="reveal" style="--d:1">Encrypted in your browser before it’s saved. Only people with the link can read it.</p>
          </section>`;
 
     const accountNote = editing ? '' : currentUser
       ? `<p class="create-note">${icon('person')}<span>Saved to your account · <a href="#/mine">My Pastes</a></span></p>`
-      : `<p class="create-note"><span><a href="#/login">Sign in</a> to edit and manage your pastes later.</span></p>`;
+      : `<p class="create-note"><span><a href="#/login">Sign in</a> for custom links, private pastes and editing later.</span></p>`;
 
     const actions = editing
       ? `<div class="create-bar edit-bar reveal" style="--d:4">
-           <a class="btn large" href="#/${esc(existing.id)}">Cancel</a>
+           <a class="btn large" href="#/${esc(existing.link)}">Cancel</a>
            <button class="btn primary large create" type="button"><span class="label">Save Changes</span><span class="spinner"></span></button>
          </div>
          <div class="danger-zone reveal" style="--d:5">
@@ -598,22 +1187,24 @@
 
         <h2 class="section-label reveal" style="--d:3">Options</h2>
         <div class="group card reveal" style="--d:3">
+          ${customRow}
+          <div class="row">
+            <div class="row-label">
+              <span class="row-icon" style="background:#5e5ce6">${icon('eye')}</span>
+              <span class="row-text">Visibility<small>Who can find and open it</small></span>
+            </div>
+            <div class="segmented" role="radiogroup" aria-label="Visibility" style="--n:3;--i:1">
+              <button type="button" role="radio" aria-checked="false" data-value="public">Public</button>
+              <button type="button" role="radio" aria-checked="true" data-value="unlisted">Unlisted</button>
+              <button type="button" role="radio" aria-checked="false" data-value="private" ${currentUser ? '' : 'disabled title="Sign in to create private pastes"'}>Private</button>
+            </div>
+          </div>
           <div class="row">
             <div class="row-label">
               <span class="row-icon" style="background:#0a84ff">${icon('timer')}</span>
               <span class="row-text">Expires<small>Paste is deleted after this time</small></span>
             </div>
             <label class="select"><select name="expires" aria-label="Expiration">${expOptions}</select></label>
-          </div>
-          <div class="row">
-            <div class="row-label">
-              <span class="row-icon" style="background:#5e5ce6">${icon('eye')}</span>
-              <span class="row-text">Visibility<small>Unlisted pastes are hidden from Recent</small></span>
-            </div>
-            <div class="segmented" role="radiogroup" aria-label="Visibility" style="--n:2;--i:0">
-              <button type="button" role="radio" aria-checked="true" data-value="public">Public</button>
-              <button type="button" role="radio" aria-checked="false" data-value="unlisted">Unlisted</button>
-            </div>
           </div>
           <div class="row">
             <div class="row-label">
@@ -625,7 +1216,7 @@
           <div class="row">
             <div class="row-label">
               <span class="row-icon" style="background:#34c759">${icon('key')}</span>
-              <span class="row-text">Password<small>${editing && existing.has_password ? 'Leave empty to keep the current one' : 'Required to open the paste'}</small></span>
+              <span class="row-text">Password<small>${editing && existing.has_password ? 'Leave empty to keep the current one' : 'Also needed to decrypt it'}</small></span>
             </div>
             <div class="password-field">
               <input type="password" name="password" placeholder="${editing && existing.has_password ? 'Unchanged' : 'None'}" maxlength="200" autocomplete="new-password" aria-label="Password">
@@ -634,6 +1225,7 @@
             </div>
           </div>
         </div>
+        <p class="enc-status reveal" style="--d:3" aria-live="polite"></p>
 
         ${actions}
       </div>`).firstElementChild;
@@ -655,9 +1247,42 @@
     const password = $('input[name=password]', page);
     const pwToggle = $('.pw-toggle', page);
     const pwRemove = $('.pw-remove', page);
-    let visibility = 'public';
+    const encStatus = $('.enc-status', page);
+    const custom = $('input[name=custom]', page);
+    const linkHint = $('.link-hint', page);
+    const linkStatus = $('.link-status', page);
+    let visibility = 'unlisted';
     let detected = 'plaintext';
     let removePassword = false;
+    let linkState = { value: '', ok: true, message: '' };
+
+    // Encryption status line under the options
+    function updateEncStatus() {
+      const hasPw = removePassword ? false : !!password.value || (editing && existing.has_password);
+      let kind = 'secure';
+      let text;
+      if (!hasCrypto) {
+        kind = 'warn';
+        text = 'Encryption isn’t available here — open QuickPaste over HTTPS.';
+      } else if (legacy) {
+        kind = 'warn';
+        text = 'This paste was created before encryption, so it’s stored unencrypted. Duplicate it to get an encrypted copy with a new link.';
+      } else if (visibility === 'public' && !hasPw) {
+        kind = 'open';
+        text = 'Public pastes are listed in Recent and stored unencrypted, so anyone (including site admins) can read them.';
+      } else if (visibility === 'public') {
+        text = 'Listed in Recent, but the content is end-to-end encrypted with the password.';
+      } else if (visibility === 'private') {
+        text = 'End-to-end encrypted, and only you can open it.';
+      } else {
+        text = 'End-to-end encrypted. Only people with the link can read it — not even the site admins.';
+      }
+      if (editing && !legacy && existing.visibility === 'public' && visibility !== 'public') {
+        text += ' This link was public before, so it may already be known — duplicate it for a fresh link.';
+      }
+      encStatus.className = `enc-status ${kind}`;
+      encStatus.innerHTML = `${icon(kind === 'secure' ? 'shield' : kind === 'open' ? 'globe' : 'warn')}<span>${esc(text)}</span>`;
+    }
 
     pwToggle.addEventListener('click', () => {
       const show = password.type === 'password';
@@ -665,6 +1290,7 @@
       pwToggle.setAttribute('aria-pressed', String(show));
       pwToggle.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
     });
+    password.addEventListener('input', updateEncStatus);
     pwRemove?.addEventListener('click', () => {
       removePassword = !removePassword;
       password.value = '';
@@ -672,6 +1298,45 @@
       password.placeholder = removePassword ? 'Will be removed' : 'Unchanged';
       pwRemove.textContent = removePassword ? 'Undo' : 'Remove';
       pwRemove.closest('.password-field').classList.toggle('removing', removePassword);
+      updateEncStatus();
+    });
+
+    // Custom link: validate as you type and check availability by its lookup id only
+    function setLinkHint(message, kind = '') {
+      if (!linkHint) return;
+      linkHint.textContent = message;
+      linkHint.className = `link-hint ${kind}`;
+    }
+    function defaultLinkHint() {
+      if (!currentUser) return setLinkHint('Sign in to choose your own link');
+      if (!linkLeft) return setLinkHint(`You’ve used all ${account?.custom_limit ?? 0} custom links`, 'bad');
+      setLinkHint(`${linkLeft} of ${account.custom_limit} left · easy words are easy to guess`);
+    }
+    let linkTimer;
+    let linkCheck = 0;
+    custom?.addEventListener('input', () => {
+      clearTimeout(linkTimer);
+      const value = normLink(custom.value);
+      linkStatus.className = 'link-status';
+      const check = ++linkCheck;
+      if (!value) { linkState = { value: '', ok: true }; defaultLinkHint(); return; }
+      const problem = linkProblem(value);
+      if (problem) { linkState = { value, ok: false, message: problem }; setLinkHint(problem, 'bad'); linkStatus.classList.add('bad'); return; }
+      linkState = { value, ok: false, pending: true, message: 'Checking…' };
+      setLinkHint('Checking…');
+      linkStatus.classList.add('busy');
+      linkTimer = setTimeout(async () => {
+        try {
+          const { lookup } = await linkSecrets(value);
+          const free = await api.linkAvailable(lookup);
+          if (check !== linkCheck) return;
+          linkState = { value, ok: free, message: free ? '' : 'That link is already taken' };
+          setLinkHint(free ? `#/${value} is available` : 'That link is already taken', free ? 'good' : 'bad');
+          linkStatus.className = `link-status ${free ? 'good' : 'bad'}`;
+        } catch {
+          if (check === linkCheck) { linkState = { value, ok: true }; setLinkHint(''); linkStatus.className = 'link-status'; }
+        }
+      }, 450);
     });
 
     // Live syntax highlighting: a highlighted <pre> sits behind a transparent textarea.
@@ -715,17 +1380,24 @@
     });
 
     function setVisibility(v) {
+      if (v === 'private' && !currentUser) v = 'unlisted';
       visibility = v;
       [...seg.querySelectorAll('button')].forEach((b, i) => {
         const on = b.dataset.value === v;
         b.setAttribute('aria-checked', String(on));
         if (on) seg.style.setProperty('--i', i);
       });
+      updateEncStatus();
     }
-    seg.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { setVisibility(b.dataset.value); saveDraft(); } });
+    seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b && !b.disabled) { setVisibility(b.dataset.value); saveDraft(); }
+    });
     seg.addEventListener('keydown', (e) => {
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-      setVisibility(visibility === 'public' ? 'unlisted' : 'public');
+      const options = [...seg.querySelectorAll('button:not([disabled])')].map((b) => b.dataset.value);
+      const i = options.indexOf(visibility);
+      setVisibility(options[(i + (e.key === 'ArrowRight' ? 1 : -1) + options.length) % options.length]);
       $(`[aria-checked="true"]`, seg).focus();
     });
 
@@ -759,8 +1431,9 @@
     ta.value = draft.content || '';
     if (draft.language && LANG_NAME[draft.language]) language.value = draft.language;
     if (draft.expires != null && [...expires.options].some((o) => o.value === draft.expires)) expires.value = draft.expires;
-    if (draft.visibility) setVisibility(draft.visibility);
+    setVisibility(draft.visibility || 'unlisted');
     burn.checked = !!draft.burn;
+    defaultLinkHint();
     refresh();
     runDetect();
     paint();
@@ -805,18 +1478,28 @@
       toast(`Loaded ${file.name}`);
     });
 
-    function reject(message) {
-      shake(form);
+    function reject(message, el = form) {
+      shake(el);
       toast(message, 'error');
-      ta.focus();
+      if (el === form) ta.focus(); else el.querySelector('input')?.focus();
     }
 
     let busy = false;
     async function submit() {
       if (busy) return;
       const content = ta.value;
+      if (!hasCrypto) return reject('Encryption isn’t available here — open QuickPaste over HTTPS');
       if (!content.trim()) return reject('Add some content first');
       if (content.length > MAX_CHARS) return reject('Paste is too large (max 500 KB)');
+      if (custom && linkState.value && !linkState.ok) {
+        return reject(linkState.pending ? 'Still checking your custom link…' : linkState.message, custom.closest('.row'));
+      }
+      if (currentUser && !vaultKey && !legacy) {
+        toast('Unlock your account first so this paste is saved to My Pastes', 'error');
+        location.hash = '#/mine';
+        return;
+      }
+      if (password.value && password.value.length < 4) return reject('Use at least 4 characters for the password', password.closest('.row'));
 
       busy = true;
       createBtn.disabled = true;
@@ -832,27 +1515,27 @@
 
       try {
         if (editing) {
-          const updated = await api.update(existing.id, {
-            ...input,
-            changeExpiry: !keepExpiry,
+          const saved = await savePaste(existing, {
+            ...input, changeExpiry: !keepExpiry,
             passwordMode: removePassword ? 'remove' : input.password ? 'set' : 'keep',
           });
-          cache.set(existing.id, updated);
-          location.hash = `#/${existing.id}`;
+          cache.set(saved.link, saved);
+          location.hash = `#/${saved.link}`;
           toast('Changes saved');
         } else {
-          const id = await api.create(input);
-          cache.set(id, {
-            id, title: input.title, content, language: lang, visibility,
-            burn_after_read: input.burn, has_password: !!input.password, views: 0,
-            own: true, is_owner: !!currentUser,
+          const { link, body } = await createPaste({ ...input, customLink: linkState.value || null });
+          cache.set(link, {
+            id: link, link, rowId: body.id, title: input.title, content, language: lang, visibility,
+            burn_after_read: input.burn, has_password: !!input.password, password: input.password || null,
+            encrypted: !!body.enc, views: 0, own: true, is_owner: !!currentUser, is_custom: !!linkState.value,
             created_at: new Date().toISOString(),
             expires_at: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
           });
           clearTimeout(draftTimer);
           storage.del(DRAFT_KEY);
-          const copied = await copyText(pasteUrl(id)).catch(() => false);
-          location.hash = `#/${id}`;
+          if (linkState.value) refreshAccount();
+          const copied = await copyText(pasteUrl(link)).catch(() => false);
+          location.hash = `#/${link}`;
           toast(copied ? 'Paste created — link copied' : 'Paste created');
         }
       } catch (err) {
@@ -886,8 +1569,9 @@
     });
     if (!ok) return false;
     try {
-      await api.remove(p.id);
-      cache.delete(p.id);
+      await api.remove(p.rowId);
+      if (p.link) cache.delete(p.link);
+      if (p.is_custom) refreshAccount();
       toast('Paste deleted');
       return true;
     } catch (err) {
@@ -904,28 +1588,29 @@
     const name = p.title || 'Untitled';
     const lines = lineCount(p.content);
     const owner = !!p.is_owner;
+    const vis = VISIBILITY[p.visibility] || VISIBILITY.public;
 
     const meta = [
       `<span>${icon('clock')}<time datetime="${esc(p.created_at)}" title="${esc(new Date(p.created_at).toLocaleString())}">${esc(relativeTime(p.created_at))}</time></span>`,
       `<span>${icon('lines')}${plural(lines, 'line')} · ${formatBytes(byteLength(p.content))}</span>`,
-      `<span>${icon(p.visibility === 'unlisted' ? 'lock' : 'globe')}${p.visibility === 'unlisted' ? 'Unlisted' : 'Public'}</span>`,
+      `<span>${icon(vis.icon)}${vis.label}</span>`,
     ];
-    if (p.has_password) meta.push(`<span>${icon('key')}Password protected</span>`);
+    if (p.encrypted) meta.push(`<span class="secure">${icon('shield')}End-to-end encrypted</span>`);
+    else if (owner) meta.push(`<span>${icon('unlock')}Not encrypted</span>`);
+    if (p.has_password) meta.push(`<span>${icon('key')}Password</span>`);
     if (owner ? !p.own : !p.own && !p.burn_after_read) meta.push(`<span>${icon('eye')}${plural(p.views || 0, 'view')}</span>`);
     if (p.expires_at) meta.push(`<span>${icon('timer')}${isExpired(p) ? 'Expired' : `Expires ${esc(relativeTime(p.expires_at))}`}</span>`);
 
     const banners = [];
+    const banner = (kind, glyph, heading, text) =>
+      `<div class="banner ${kind} reveal" style="--d:2">${icon(glyph)}<div><strong>${heading}</strong>${text}</div></div>`;
     if (owner && isExpired(p)) {
-      banners.push(`<div class="banner info reveal" style="--d:2">${icon('timer')}<div><strong>This paste has expired</strong>Only you can see it. Edit it and choose a new expiry to share it again.</div></div>`);
+      banners.push(banner('info', 'timer', 'This paste has expired', 'Only you can see it. Edit it and choose a new expiry to share it again.'));
     }
     if (p.burn_after_read) {
-      if (owner) {
-        banners.push(`<div class="banner burn reveal" style="--d:2">${icon('flame')}<div><strong>Burn after reading is on</strong>The first person to open this link will see it — then it’s gone for good. You can view it here while signed in without burning it.</div></div>`);
-      } else if (p.own) {
-        banners.push(`<div class="banner burn reveal" style="--d:2">${icon('flame')}<div><strong>Burn after reading is on</strong>The first person to open this link will see it — then it’s gone for good. Don’t open it yourself.</div></div>`);
-      } else {
-        banners.push(`<div class="banner burn reveal" style="--d:2">${icon('flame')}<div><strong>This paste has now been destroyed</strong>It was set to burn after reading. Copy anything you need before leaving this page.</div></div>`);
-      }
+      if (owner) banners.push(banner('burn', 'flame', 'Burn after reading is on', 'The first person to open this link will see it — then it’s gone for good. You can view it here while signed in without burning it.'));
+      else if (p.own) banners.push(banner('burn', 'flame', 'Burn after reading is on', 'The first person to open this link will see it — then it’s gone for good. Don’t open it yourself.'));
+      else banners.push(banner('burn', 'flame', 'This paste has now been destroyed', 'It was set to burn after reading. Copy anything you need before leaving this page.'));
     }
 
     const page = html(`
@@ -938,31 +1623,24 @@
           </div>
           <div class="toolbar reveal" style="--d:1">
             <button class="btn primary" data-act="link">${icon('link')}<span>Copy Link</span></button>
-            ${owner ? `<a class="btn" data-act="edit" href="#/edit/${esc(p.id)}">${icon('pencil')}<span>Edit</span></a>` : ''}
+            ${owner ? `<a class="btn" data-act="edit" href="#/edit/${esc(p.link)}">${icon('pencil')}<span>Edit</span></a>` : ''}
             <button class="btn" data-act="copy">${icon('copy')}<span>Copy</span></button>
             <button class="btn icon-only" data-act="share" title="Share" aria-label="Share">${icon('share')}</button>
             <button class="btn icon-only" data-act="raw" title="View raw" aria-label="View raw">${icon('doc')}</button>
             <button class="btn icon-only" data-act="download" title="Download" aria-label="Download">${icon('download')}</button>
             <button class="btn icon-only" data-act="fork" title="Duplicate as new paste" aria-label="Duplicate as new paste">${icon('duplicate')}</button>
+            ${owner || p.own ? '' : `<button class="btn icon-only" data-act="report" title="Report" aria-label="Report">${icon('flag')}</button>`}
           </div>
         </header>
         ${banners.join('')}
-        <div class="code card reveal" style="--d:2">
-          <div class="code-gutter" aria-hidden="true"><pre></pre></div>
-          <div class="code-scroll"><pre><code class="hljs"></code></pre></div>
-        </div>
       </article>`).firstElementChild;
-
-    $('.code-gutter pre', page).textContent = Array.from({ length: lines }, (_, i) => i + 1).join('\n');
-    const code = $('code', page);
-    if (window.hljs && lang !== 'plaintext' && hljs.getLanguage(lang) && p.content.length <= HIGHLIGHT_LIMIT) {
-      code.innerHTML = hljs.highlight(p.content, { language: lang, ignoreIllegals: true }).value;
-    } else {
-      code.textContent = p.content;
-    }
+    const code = codeBlock(p.content, lang);
+    code.classList.add('reveal');
+    code.style.setProperty('--d', 2);
+    page.appendChild(code);
 
     const filename = () => {
-      const base = (p.title || p.id).replace(/[^\w.\- ]+/g, '').trim() || p.id;
+      const base = (p.title || p.link).replace(/[^\w.\- ]+/g, '').trim() || p.link;
       const ext = LANG_TO_EXT[lang] || 'txt';
       return /\.[a-z0-9]+$/i.test(base) ? base : `${base}.${ext}`;
     };
@@ -972,7 +1650,7 @@
       if (!btn) return;
       switch (btn.dataset.act) {
         case 'link':
-          toast((await copyText(pasteUrl(p.id))) ? 'Link copied' : 'Couldn’t copy link');
+          toast((await copyText(pasteUrl(p.link))) ? 'Link copied' : 'Couldn’t copy link');
           break;
         case 'copy':
           toast((await copyText(p.content)) ? 'Copied to clipboard' : 'Couldn’t copy');
@@ -994,14 +1672,56 @@
           break;
         }
         case 'fork':
-          prefill = { title: p.title, content: p.content, language: lang };
+          prefill = { title: p.title, content: p.content, language: lang, visibility: p.visibility === 'public' ? 'public' : 'unlisted' };
           location.hash = '#/';
+          break;
+        case 'report':
+          openReport(p);
           break;
       }
     });
 
     page.docTitle = `${name} · QuickPaste`;
     return page;
+  }
+
+  function openReport(p) {
+    const reasons = REPORT_REASONS.map(([v, l], i) => `
+      <label class="choice"><input type="radio" name="reason" value="${v}" ${i === 0 ? 'checked' : ''}><span>${esc(l)}</span></label>`).join('');
+    const { el, close } = openModal(`
+      <form class="report-form" novalidate>
+        <div class="dialog-icon">${icon('flag')}</div>
+        <h2>Report this paste</h2>
+        <p>Reporting shares this paste’s link with the site admins so they can decrypt and review it. Nobody else sees your report.</p>
+        <fieldset class="choices">${reasons}</fieldset>
+        <textarea name="details" rows="3" maxlength="1000" placeholder="Anything else admins should know? (optional)"></textarea>
+        ${p.has_password ? '<label class="check"><input type="checkbox" name="includePassword" checked><span>Include the password so admins can read it</span></label>' : ''}
+        <div class="dialog-actions">
+          <button class="btn" type="button" data-v="0">Cancel</button>
+          <button class="btn destructive" type="submit"><span class="label">Report</span><span class="spinner"></span></button>
+        </div>
+      </form>`);
+    const form = $('form', el);
+    $('[data-v="0"]', el).addEventListener('click', () => close(false));
+    $('input[name=reason]', el).focus();
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = $('button[type=submit]', form);
+      btn.disabled = true;
+      btn.classList.add('loading');
+      try {
+        await api.report({
+          id: p.rowId, link: p.link, reason: form.elements.reason.value, details: form.elements.details.value,
+          password: form.elements.includePassword?.checked ? p.password : null,
+        });
+        close(true);
+        toast('Thanks — the admins will take a look');
+      } catch (err) {
+        toast(err.message || 'Couldn’t send the report', 'error');
+        btn.disabled = false;
+        btn.classList.remove('loading');
+      }
+    });
   }
 
   // ───────── View: recent ─────────
@@ -1014,10 +1734,10 @@
       <a class="tile card reveal" style="--d:${Math.min(i, 10) + 1}" href="#/${esc(p.id)}">
         <div class="tile-body">
           <div class="tile-top">
-            <span class="tag">${esc(LANG_NAME[p.language] || p.language || 'Plain Text')}</span>
+            <span class="tag">${p.locked && !p.language ? `${icon('shield')}Encrypted` : esc(LANG_NAME[p.language] || p.language || 'Plain Text')}</span>
             <time datetime="${esc(p.created_at)}">${esc(relativeTime(p.created_at))}</time>
           </div>
-          <h3>${esc(p.title || 'Untitled')}</h3>
+          <h3>${esc(p.title || (p.locked ? 'Protected paste' : 'Untitled'))}</h3>
         </div>
         ${p.locked
           ? `<div class="tile-locked">${icon('lock')}<span>Password protected</span></div>`
@@ -1034,6 +1754,22 @@
 
   // ───────── View: my pastes ─────────
 
+  function viewUnlockVault() {
+    return viewPasswordPrompt({
+      glyph: 'unlock',
+      heading: 'Unlock your pastes',
+      text: 'Your links are encrypted with your account password, so even we can’t see them. Enter it to unlock them on this device.',
+      label: 'Unlock',
+      autocomplete: 'current-password',
+      async onSubmit(pw) {
+        await api.auth.signIn(currentUser.email, pw); // verifies the password
+        await unlockVault(pw);
+        toast('Unlocked');
+        return viewMine(await loadMine());
+      },
+    });
+  }
+
   function viewMine(list) {
     if (!list.length) {
       const empty = emptyState('tray', 'No pastes yet', 'Pastes you create while signed in will show up here, ready to edit and share.', true);
@@ -1043,25 +1779,28 @@
 
     const rowHtml = (p, i) => {
       const pills = [];
-      if (p.visibility === 'unlisted') pills.push(`<span class="pill">${icon('lock')}Unlisted</span>`);
+      if (p.encrypted) pills.push(`<span class="pill green">${icon('shield')}Encrypted</span>`);
+      else pills.push(`<span class="pill">${icon('unlock')}Not encrypted</span>`);
+      if (p.is_custom) pills.push(`<span class="pill blue">${icon('link')}Custom link</span>`);
+      if (p.visibility !== 'public') pills.push(`<span class="pill">${icon(VISIBILITY[p.visibility].icon)}${VISIBILITY[p.visibility].label}</span>`);
       if (p.has_password) pills.push(`<span class="pill">${icon('key')}Password</span>`);
       if (p.burn_after_read) pills.push(`<span class="pill orange">${icon('flame')}Burn</span>`);
       if (p.expired) pills.push(`<span class="pill red">${icon('timer')}Expired</span>`);
       else if (p.expires_at) pills.push(`<span class="pill">${icon('timer')}${esc(relativeTime(p.expires_at))}</span>`);
-      const details = [LANG_NAME[p.language] || p.language || 'Plain Text', relativeTime(p.created_at), plural(p.views || 0, 'view')];
+      const details = [p.link ? `#/${p.link}` : 'Link unavailable', relativeTime(p.created_at), plural(p.views || 0, 'view')];
+      const main = `
+        ${langBadge(p.language, !p.link)}
+        <span class="mine-text">
+          <strong>${esc(p.title || (p.link ? 'Untitled' : 'Locked paste'))}</strong>
+          <small>${details.map(esc).join(' · ')}</small>
+          <span class="pills">${pills.join('')}</span>
+        </span>`;
       return `
-        <li class="mine-row reveal" style="--d:${Math.min(i, 12) + 1}" data-id="${esc(p.id)}">
-          <a class="mine-main" href="#/${esc(p.id)}">
-            ${langBadge(p.language)}
-            <span class="mine-text">
-              <strong>${esc(p.title || 'Untitled')}</strong>
-              <small>${details.map(esc).join(' · ')}</small>
-              ${pills.length ? `<span class="pills">${pills.join('')}</span>` : ''}
-            </span>
-          </a>
+        <li class="mine-row reveal" style="--d:${Math.min(i, 12) + 1}" data-row="${esc(p.rowId)}">
+          ${p.link ? `<a class="mine-main" href="#/${esc(p.link)}">${main}</a>` : `<div class="mine-main">${main}</div>`}
           <div class="mine-actions">
-            <button class="btn icon-only ghost" type="button" data-act="share" title="Share" aria-label="Share">${icon('share')}</button>
-            <a class="btn icon-only ghost" href="#/edit/${esc(p.id)}" title="Edit" aria-label="Edit">${icon('pencil')}</a>
+            ${p.link ? `<button class="btn icon-only ghost" type="button" data-act="share" title="Share" aria-label="Share">${icon('share')}</button>
+            <a class="btn icon-only ghost" href="#/edit/${esc(p.link)}" title="Edit" aria-label="Edit">${icon('pencil')}</a>` : ''}
             <button class="btn icon-only ghost danger" type="button" data-act="delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
           </div>
         </li>`;
@@ -1081,7 +1820,8 @@
 
     const count = $('.count', page);
     const updateCount = () => {
-      count.textContent = `${plural(list.length, 'paste')} · ${currentUser?.email || ''}`;
+      const links = account ? ` · ${account.custom_used} of ${account.custom_limit} custom links used` : '';
+      count.textContent = `${plural(list.length, 'paste')}${links}`;
     };
     updateCount();
 
@@ -1089,10 +1829,11 @@
       const btn = e.target.closest('button[data-act]');
       if (!btn) return;
       const row = btn.closest('.mine-row');
-      const p = list.find((x) => x.id === row.dataset.id);
+      const p = list.find((x) => x.rowId === row.dataset.row);
       if (btn.dataset.act === 'share') return sharePaste(p);
       if (btn.dataset.act === 'delete' && (await deletePaste(p))) {
         list.splice(list.indexOf(p), 1);
+        if (p.is_custom && account) account.custom_used = Math.max(0, account.custom_used - 1);
         updateCount();
         const h = row.offsetHeight;
         await settle(row.animate(
@@ -1108,13 +1849,404 @@
     return page;
   }
 
+  // ───────── View: admin dashboard ─────────
+
+  const ADMIN_TABS = [['reports', 'Reports'], ['pastes', 'Pastes'], ['users', 'Users'], ['settings', 'Settings']];
+
+  function viewAdmin(tab, stats) {
+    const index = ADMIN_TABS.findIndex(([k]) => k === tab);
+    const tile = (label, value, glyph, color) => `
+      <div class="stat card"><span class="stat-icon" style="--c:${color}">${icon(glyph)}</span>
+        <span class="stat-text"><strong>${Number(value || 0).toLocaleString()}</strong><small>${label}</small></span></div>`;
+    const page = html(`
+      <div class="page page-admin">
+        <header class="page-head">
+          <p class="eyebrow reveal">Admin</p>
+          <h1 class="reveal" style="--d:1">Dashboard</h1>
+        </header>
+        <div class="stats reveal" style="--d:1">
+          ${tile('Open reports', stats.open_reports, 'flag', '#ff3b30')}
+          ${tile('Pastes', stats.pastes, 'doc', '#0a84ff')}
+          ${tile('Encrypted', stats.encrypted, 'shield', '#34c759')}
+          ${tile('Users', stats.users, 'users', '#5e5ce6')}
+        </div>
+        <nav class="segmented admin-tabs reveal" style="--d:2;--n:4;--i:${index}" aria-label="Admin sections">
+          ${ADMIN_TABS.map(([k, l]) => `<a href="#/admin/${k}" aria-current="${k === tab ? 'page' : 'false'}">${l}</a>`).join('')}
+        </nav>
+        <section class="admin-panel reveal" style="--d:3"></section>
+      </div>`).firstElementChild;
+
+    const panel = $('.admin-panel', page);
+    const renderers = { reports: adminReports, pastes: adminPastes, users: adminUsers, settings: adminSettings };
+    const refreshStats = async () => {
+      try {
+        const s = await api.admin.overview();
+        const values = [s.open_reports, s.pastes, s.encrypted, s.users];
+        page.querySelectorAll('.stat strong').forEach((n, i) => { n.textContent = Number(values[i] || 0).toLocaleString(); });
+      } catch { /* keep old numbers */ }
+    };
+    renderers[tab](panel, { refreshStats, stats });
+    page.docTitle = 'Admin · QuickPaste';
+    return page;
+  }
+
+  async function adminAction(fn, success) {
+    try {
+      await fn();
+      if (success) toast(success);
+      return true;
+    } catch (err) {
+      toast(err.message || 'Something went wrong', 'error');
+      return false;
+    }
+  }
+
+  const confirmDeletePaste = () => confirmDialog({
+    title: 'Delete this paste?', message: 'It will be removed for everyone. This can’t be undone.',
+    confirmLabel: 'Delete', destructive: true,
+  });
+
+  function adminReports(panel, ctx) {
+    let status = 'open';
+    panel.innerHTML = `
+      <div class="panel-bar">
+        <div class="segmented small" style="--n:2;--i:0" role="radiogroup" aria-label="Report status">
+          <button type="button" role="radio" aria-checked="true" data-value="open">Open</button>
+          <button type="button" role="radio" aria-checked="false" data-value="all">All</button>
+        </div>
+      </div>
+      <ul class="admin-list card"></ul>`;
+    const list = $('.admin-list', panel);
+    const seg = $('.segmented', panel);
+    let reports = [];
+
+    async function load() {
+      try {
+        reports = await api.admin.reports(status);
+      } catch (err) {
+        list.innerHTML = `<li class="admin-empty">${esc(err.message)}</li>`;
+        return;
+      }
+      if (!reports.length) {
+        list.innerHTML = `<li class="admin-empty">${icon('check')}<span>${status === 'open' ? 'No open reports. All clear!' : 'No reports yet.'}</span></li>`;
+        return;
+      }
+      list.innerHTML = reports.map((r) => {
+        const what = !r.paste_exists ? 'Paste no longer exists' : r.title || (r.encrypted ? 'Encrypted paste' : 'Untitled');
+        const who = [`Reported ${relativeTime(r.created_at)}`, r.reporter_email ? `by ${r.reporter_email}` : 'anonymously'];
+        if (r.owner_email) who.push(`owner ${r.owner_email}`);
+        const vis = VISIBILITY[r.visibility];
+        return `
+          <li class="admin-item report" data-id="${r.id}">
+            <div class="admin-item-main">
+              <span class="pills">
+                <span class="pill red">${icon('flag')}${esc(REASON_NAME[r.reason] || r.reason)}</span>
+                ${r.status !== 'open' ? `<span class="pill">${esc(r.status[0].toUpperCase() + r.status.slice(1))}</span>` : ''}
+                ${r.paste_exists && vis ? `<span class="pill">${icon(vis.icon)}${vis.label}</span>` : ''}
+                ${r.encrypted ? `<span class="pill green">${icon('shield')}Encrypted</span>` : ''}
+              </span>
+              <strong>${esc(what)}</strong>
+              <small>${esc(who.join(' · '))}${r.link ? ` · <code>#/${esc(r.link)}</code>` : ''}</small>
+              ${r.details ? `<p class="report-details">${esc(r.details)}</p>` : ''}
+            </div>
+            <div class="admin-actions">
+              ${r.paste_exists ? `<button class="btn small" type="button" data-act="review">${icon('eye')}<span>Review</span></button>` : ''}
+              ${r.paste_exists && r.visibility !== 'private' ? `<button class="btn small" type="button" data-act="hide">${icon('lock')}<span>Make private</span></button>` : ''}
+              ${r.paste_exists ? `<button class="btn small danger-soft" type="button" data-act="delete">${icon('trash')}<span>Delete</span></button>` : ''}
+              ${r.status === 'open'
+                ? `<button class="btn small" type="button" data-act="resolved">${icon('check')}<span>Resolve</span></button>
+                   <button class="btn small ghost" type="button" data-act="dismissed">Dismiss</button>`
+                : '<button class="btn small ghost" type="button" data-act="open">Reopen</button>'}
+            </div>
+          </li>`;
+      }).join('');
+    }
+
+    list.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const r = reports.find((x) => String(x.id) === btn.closest('.admin-item').dataset.id);
+      const act = btn.dataset.act;
+      const done = () => { load(); ctx.refreshStats(); };
+      if (act === 'review') return reviewPaste(r.paste_id, { link: r.link, password: r.password, onChange: done });
+      let ok = false;
+      if (act === 'hide') ok = await adminAction(() => api.admin.setVisibility(r.paste_id, 'private'), 'Paste is now private');
+      if (act === 'delete') {
+        if (!(await confirmDeletePaste())) return;
+        ok = await adminAction(async () => {
+          await api.admin.deletePaste(r.paste_id);
+          if (r.status === 'open') await api.admin.setReportStatus(r.id, 'resolved');
+        }, 'Paste deleted');
+      }
+      if (['resolved', 'dismissed', 'open'].includes(act)) {
+        ok = await adminAction(() => api.admin.setReportStatus(r.id, act), act === 'open' ? 'Report reopened' : `Report ${act}`);
+      }
+      if (ok) done();
+    });
+
+    seg.addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      status = b.dataset.value;
+      [...seg.children].forEach((n, i) => {
+        n.setAttribute('aria-checked', String(n === b));
+        if (n === b) seg.style.setProperty('--i', i);
+      });
+      load();
+    });
+    load();
+  }
+
+  // Admin review: plain pastes show directly; encrypted ones only with the link (and password) from a report.
+  async function reviewPaste(rowId, { link = null, password = null, onChange } = {}) {
+    let row;
+    try { row = await api.admin.getPaste(rowId); } catch (err) { toast(err.message, 'error'); return; }
+    if (!row) { toast('That paste no longer exists', 'error'); onChange?.(); return; }
+    let paste = null;
+    let problem = '';
+    try {
+      if (!row.encrypted) paste = row;
+      else if (!link) problem = 'This paste is end-to-end encrypted. Admins can only read encrypted pastes that were reported with their link.';
+      else paste = await decodeRow(row, normLink(link), password);
+    } catch (err) {
+      problem = err.needPassword
+        ? 'This paste has a password and the report didn’t include it, so it can’t be decrypted.'
+        : 'The reported link didn’t decrypt this paste.';
+    }
+    const vis = VISIBILITY[row.visibility] || VISIBILITY.public;
+    const { el, close } = openModal(`
+      <div class="review">
+        <div class="review-head">
+          <div>
+            <p class="eyebrow">${esc(paste ? LANG_NAME[paste.language] || paste.language || 'Plain Text' : 'Encrypted')}</p>
+            <h2>${esc(paste?.title || 'Untitled')}</h2>
+            <div class="meta">
+              <span>${icon(vis.icon)}${vis.label}</span>
+              <span>${icon('clock')}${esc(relativeTime(row.created_at))}</span>
+              <span>${icon('eye')}${plural(row.views || 0, 'view')}</span>
+              ${row.encrypted ? `<span class="secure">${icon('shield')}Encrypted</span>` : ''}
+            </div>
+          </div>
+          <button class="btn icon-only ghost close" type="button" aria-label="Close">${icon('x')}</button>
+        </div>
+        <div class="review-body">${problem ? `<div class="banner info">${icon('lock')}<div>${esc(problem)}</div></div>` : ''}</div>
+        <div class="review-actions">
+          <label class="select"><select name="visibility" aria-label="Visibility">
+            ${Object.entries(VISIBILITY).map(([k, v]) => `<option value="${k}" ${k === row.visibility ? 'selected' : ''}>${v.label}</option>`).join('')}
+          </select></label>
+          <button class="btn destructive" type="button" data-act="delete">${icon('trash')}<span>Delete Paste</span></button>
+        </div>
+      </div>`, { wide: true });
+    if (paste) $('.review-body', el).appendChild(codeBlock(paste.content, paste.language || 'plaintext'));
+    $('.close', el).addEventListener('click', () => close(false));
+    $('select[name=visibility]', el).addEventListener('change', async (e) => {
+      const value = e.target.value;
+      if (await adminAction(() => api.admin.setVisibility(rowId, value), `Paste is now ${VISIBILITY[value].label.toLowerCase()}`)) {
+        row.visibility = value;
+        onChange?.();
+      } else {
+        e.target.value = row.visibility;
+      }
+    });
+    $('[data-act=delete]', el).addEventListener('click', async () => {
+      if (!(await confirmDeletePaste())) return;
+      if (await adminAction(() => api.admin.deletePaste(rowId), 'Paste deleted')) { close(true); onChange?.(); }
+    });
+  }
+
+  function adminPastes(panel, ctx) {
+    panel.innerHTML = `
+      <div class="panel-bar">
+        <input class="search" type="search" placeholder="Search by title, public link, owner email or id" aria-label="Search pastes">
+      </div>
+      <ul class="admin-list card"></ul>`;
+    const list = $('.admin-list', panel);
+    const search = $('.search', panel);
+
+    async function load() {
+      let rows;
+      try {
+        rows = await api.admin.pastes(search.value.trim());
+      } catch (err) {
+        list.innerHTML = `<li class="admin-empty">${esc(err.message)}</li>`;
+        return;
+      }
+      if (!rows.length) {
+        list.innerHTML = `<li class="admin-empty">${icon('tray')}<span>No pastes found.</span></li>`;
+        return;
+      }
+      list.innerHTML = rows.map((p) => {
+        const pills = [p.encrypted ? `<span class="pill green">${icon('shield')}Encrypted</span>` : `<span class="pill">${icon('unlock')}Readable</span>`];
+        if (p.is_custom) pills.push(`<span class="pill blue">${icon('link')}Custom</span>`);
+        if (p.has_password) pills.push(`<span class="pill">${icon('key')}Password</span>`);
+        if (p.burn_after_read) pills.push(`<span class="pill orange">${icon('flame')}Burn</span>`);
+        if (p.expired) pills.push(`<span class="pill red">${icon('timer')}Expired</span>`);
+        if (p.open_reports) pills.push(`<span class="pill red">${icon('flag')}${plural(p.open_reports, 'report')}</span>`);
+        const name = p.title || (p.encrypted ? 'Encrypted paste' : 'Untitled');
+        const sub = [p.owner_email || 'Anonymous', relativeTime(p.created_at), plural(p.views || 0, 'view'), formatBytes(p.size || 0)];
+        const link = p.public_slug || (isLegacyRow(p.id) ? p.id : null);
+        return `
+          <li class="admin-item" data-id="${esc(p.id)}">
+            ${langBadge(p.language, p.encrypted)}
+            <div class="admin-item-main">
+              <strong>${esc(name)}</strong>
+              <small>${esc(sub.join(' · '))}${link ? ` · <code>#/${esc(link)}</code>` : ''}</small>
+              <span class="pills">${pills.join('')}</span>
+            </div>
+            <div class="admin-actions">
+              ${p.encrypted ? '' : `<button class="btn small" type="button" data-act="review">${icon('eye')}<span>View</span></button>`}
+              <label class="select small"><select data-act="visibility" aria-label="Visibility">
+                ${Object.entries(VISIBILITY).map(([k, v]) => `<option value="${k}" ${k === p.visibility ? 'selected' : ''}>${v.label}</option>`).join('')}
+              </select></label>
+              <button class="btn icon-only ghost danger" type="button" data-act="delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
+            </div>
+          </li>`;
+      }).join('');
+    }
+
+    list.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const id = btn.closest('.admin-item').dataset.id;
+      const done = () => { load(); ctx.refreshStats(); };
+      if (btn.dataset.act === 'review') return reviewPaste(id, { onChange: done });
+      if (btn.dataset.act === 'delete' && (await confirmDeletePaste())) {
+        if (await adminAction(() => api.admin.deletePaste(id), 'Paste deleted')) done();
+      }
+    });
+    list.addEventListener('change', async (e) => {
+      const select = e.target.closest('select[data-act=visibility]');
+      if (!select) return;
+      const id = select.closest('.admin-item').dataset.id;
+      const ok = await adminAction(() => api.admin.setVisibility(id, select.value), `Paste is now ${VISIBILITY[select.value].label.toLowerCase()}`);
+      if (!ok) load();
+    });
+    let timer;
+    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 300); });
+    load();
+  }
+
+  function adminUsers(panel, ctx) {
+    panel.innerHTML = `
+      <div class="panel-bar">
+        <input class="search" type="search" placeholder="Search by email" aria-label="Search users">
+      </div>
+      <ul class="admin-list card"></ul>`;
+    const list = $('.admin-list', panel);
+    const search = $('.search', panel);
+    let users = [];
+
+    async function load() {
+      try {
+        users = await api.admin.users(search.value.trim());
+      } catch (err) {
+        list.innerHTML = `<li class="admin-empty">${esc(err.message)}</li>`;
+        return;
+      }
+      if (!users.length) {
+        list.innerHTML = `<li class="admin-empty">${icon('users')}<span>No users found.</span></li>`;
+        return;
+      }
+      list.innerHTML = users.map((u) => {
+        const sub = [
+          `Joined ${relativeTime(u.created_at)}`,
+          u.last_sign_in_at ? `last sign-in ${relativeTime(u.last_sign_in_at)}` : 'never signed in',
+          plural(u.pastes, 'paste'),
+        ];
+        return `
+          <li class="admin-item" data-id="${esc(u.id)}">
+            <span class="avatar" aria-hidden="true">${esc((u.email || '?')[0].toUpperCase())}</span>
+            <div class="admin-item-main">
+              <strong>${esc(u.email)}</strong>
+              <small>${esc(sub.join(' · '))}</small>
+              <span class="pills">
+                ${u.is_admin ? `<span class="pill blue">${icon('shield')}Admin</span>` : ''}
+                ${u.is_me ? '<span class="pill">You</span>' : ''}
+                <span class="pill">${icon('link')}${u.custom_used} of ${u.custom_limit} custom links${u.custom_limit_override == null ? ' (default)' : ''}</span>
+              </span>
+            </div>
+            <div class="admin-actions">
+              <label class="limit-field" title="Custom link limit">
+                <span>Limit</span>
+                <input type="number" min="0" max="10000" step="1" value="${u.custom_limit}" aria-label="Custom link limit for ${esc(u.email)}">
+              </label>
+              <button class="btn small" type="button" data-act="limit">Save</button>
+              ${u.custom_limit_override != null ? '<button class="btn small ghost" type="button" data-act="reset">Use default</button>' : ''}
+              <button class="btn icon-only ghost danger" type="button" data-act="delete" title="${u.is_me || u.is_admin ? 'Admins can’t be deleted here' : 'Delete user'}" aria-label="Delete user" ${u.is_me || u.is_admin ? 'disabled' : ''}>${icon('trash')}</button>
+            </div>
+          </li>`;
+      }).join('');
+    }
+
+    list.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      if (!btn) return;
+      const item = btn.closest('.admin-item');
+      const u = users.find((x) => x.id === item.dataset.id);
+      if (btn.dataset.act === 'limit') {
+        const value = Number($('input', item).value);
+        if (!Number.isInteger(value) || value < 0 || value > 10000) return toast('Enter a number from 0 to 10,000', 'error');
+        if (await adminAction(() => api.admin.setUserLimit(u.id, value), `${u.email} can now use ${plural(value, 'custom link')}`)) {
+          load();
+          if (u.is_me) refreshAccount();
+        }
+      }
+      if (btn.dataset.act === 'reset') {
+        if (await adminAction(() => api.admin.setUserLimit(u.id, null), `${u.email} is back to the default limit`)) {
+          load();
+          if (u.is_me) refreshAccount();
+        }
+      }
+      if (btn.dataset.act === 'delete') {
+        const ok = await confirmDialog({
+          title: `Delete ${u.email}?`,
+          message: `Their account and ${plural(u.pastes, 'paste')} will be deleted. This can’t be undone.`,
+          confirmLabel: 'Delete User', destructive: true,
+        });
+        if (ok && (await adminAction(() => api.admin.deleteUser(u.id), 'User deleted'))) { load(); ctx.refreshStats(); }
+      }
+    });
+    let timer;
+    search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 300); });
+    load();
+  }
+
+  function adminSettings(panel, ctx) {
+    panel.innerHTML = `
+      <h2 class="section-label">Custom links</h2>
+      <div class="group card">
+        <div class="row">
+          <div class="row-label">
+            <span class="row-icon" style="background:#ff2d55">${icon('link')}</span>
+            <span class="row-text">Default limit<small>Custom links each account can create, unless you set a personal limit under Users</small></span>
+          </div>
+          <div class="limit-inline">
+            <input type="number" min="0" max="10000" step="1" value="${Number(ctx.stats.default_limit ?? 5)}" aria-label="Default custom link limit">
+            <button class="btn small primary" type="button">Save</button>
+          </div>
+        </div>
+      </div>
+      <h2 class="section-label">Admins</h2>
+      <div class="group card info-card">
+        <p>To make someone an admin, run this in the Supabase SQL Editor:</p>
+        <pre><code>insert into public.admins (user_id)
+select id from auth.users where email = 'them@example.com';</code></pre>
+        <p>Admins can’t read encrypted pastes unless someone reports one with its link.</p>
+      </div>`;
+    $('.limit-inline button', panel).addEventListener('click', async () => {
+      const value = Number($('.limit-inline input', panel).value);
+      if (!Number.isInteger(value) || value < 0 || value > 10000) return toast('Enter a number from 0 to 10,000', 'error');
+      if (await adminAction(() => api.admin.setDefaultLimit(value), `Default limit is now ${value}`)) refreshAccount();
+    });
+  }
+
   // ───────── View: sign in / create account ─────────
 
   function viewAuth({ returnTo = '#/mine', note = '' } = {}) {
     let mode = 'signin';
     const copy = {
       signin: { title: 'Sign in to QuickPaste', button: 'Sign In', fine: 'New here? Choose Create Account above.' },
-      signup: { title: 'Create your account', button: 'Create Account', fine: `Use at least ${MIN_PASSWORD} characters for your password.` },
+      signup: { title: 'Create your account', button: 'Create Account', fine: `Use at least ${MIN_PASSWORD} characters. Your password also unlocks your encrypted list of pastes, so keep it safe.` },
     };
 
     const page = html(`
@@ -1122,7 +2254,7 @@
         <div class="auth-card card reveal">
           <img class="auth-icon" src="assets/icon.svg" alt="" width="60" height="60">
           <h1 class="auth-title">${copy.signin.title}</h1>
-          <p class="auth-sub">${esc(note || 'Keep your pastes in one place — edit, share and manage them anytime.')}</p>
+          <p class="auth-sub">${esc(note || 'Custom links, private pastes, and one place to edit, share and manage them.')}</p>
           <div class="segmented" role="radiogroup" aria-label="Account" style="--n:2;--i:0">
             <button type="button" role="radio" aria-checked="true" data-value="signin">Sign In</button>
             <button type="button" role="radio" aria-checked="false" data-value="signup">Create Account</button>
@@ -1173,10 +2305,21 @@
       card.innerHTML = `
         <div class="glyph">${icon('mail')}</div>
         <h1 class="auth-title">Check your inbox</h1>
-        <p class="auth-sub">We sent a confirmation link to <strong>${esc(address)}</strong>. Open it to finish creating your account.</p>
+        <p class="auth-sub">We sent a confirmation link to <strong>${esc(address)}</strong>. Open it to finish creating your account, then sign in.</p>
         <button class="btn block back" type="button">Back to Sign In</button>`;
       card.animate?.([{ opacity: 0, transform: 'scale(.97)' }, { opacity: 1, transform: 'none' }], { duration: 420, easing: 'cubic-bezier(.22,1,.36,1)' });
       $('.back', card).addEventListener('click', () => navigate());
+    }
+
+    async function afterSignIn(user, pw, message) {
+      await setUser(user);
+      try {
+        if (hasCrypto) await unlockVault(pw);
+      } catch {
+        toast('Signed in, but your saved links couldn’t be unlocked', 'error');
+      }
+      toast(message);
+      if (location.hash === returnTo) navigate(); else location.hash = returnTo;
     }
 
     form.addEventListener('submit', async (e) => {
@@ -1192,16 +2335,11 @@
       submitBtn.classList.add('loading');
       try {
         if (mode === 'signin') {
-          const user = await api.auth.signIn(address, password.value);
-          setUser(user);
-          toast('Signed in');
-          location.hash = returnTo;
+          await afterSignIn(await api.auth.signIn(address, password.value), password.value, 'Signed in');
         } else {
           const res = await api.auth.signUp(address, password.value);
           if (res.needsConfirmation) return showCheckEmail(address);
-          setUser(res.user);
-          toast('Account created');
-          location.hash = returnTo;
+          await afterSignIn(res.user, password.value, 'Account created');
         }
       } catch (err) {
         fail(err.message || 'Something went wrong');
@@ -1216,20 +2354,21 @@
     return page;
   }
 
-  // ───────── View: password prompt ─────────
+  // ───────── Password prompts ─────────
 
   const notFoundState = () =>
-    emptyState('question', 'Paste not found', 'This paste doesn’t exist, has expired, or was burned after reading.', true);
+    emptyState('question', 'Paste not found', 'This paste doesn’t exist, has expired, is private, or was burned after reading.', true);
 
-  function viewLocked(id) {
+  // onSubmit(password) resolves to the next page, or throws an Error to show.
+  function viewPasswordPrompt({ glyph = 'lock', heading, text, label = 'Unlock', autocomplete = 'off', onSubmit }) {
     const page = html(`
       <div class="page empty unlock">
-        <div class="glyph reveal">${icon('lock')}</div>
-        <h1 class="reveal" style="--d:1">Password required</h1>
-        <p class="reveal" style="--d:2">This paste is protected. Enter the password to view it.</p>
+        <div class="glyph reveal">${icon(glyph)}</div>
+        <h1 class="reveal" style="--d:1">${esc(heading)}</h1>
+        <p class="reveal" style="--d:2">${esc(text)}</p>
         <form class="unlock-form reveal" style="--d:3" novalidate>
-          <input type="password" name="pw" placeholder="Password" autocomplete="current-password" aria-label="Password" required>
-          <button class="btn primary" type="submit"><span class="label">Unlock</span><span class="spinner"></span></button>
+          <input type="password" name="pw" placeholder="Password" autocomplete="${autocomplete}" aria-label="Password" required>
+          <button class="btn primary" type="submit"><span class="label">${esc(label)}</span><span class="spinner"></span></button>
         </form>
       </div>`).firstElementChild;
 
@@ -1250,23 +2389,41 @@
       btn.classList.add('loading');
       const token = navToken;
       try {
-        const p = await api.get(id, input.value);
+        const next = await onSubmit(input.value);
         if (token !== navToken) return; // user navigated away
-        if (!p) return swap(notFoundState(), { name: 'paste' });
-        if (p.locked) return fail('Incorrect password');
-        cache.set(id, p);
-        await swap(viewPaste(p), { name: 'paste' });
+        await swap(next, parseRoute());
       } catch (err) {
-        toast(err.message || 'Something went wrong', 'error');
+        fail(err.message || 'Something went wrong');
       } finally {
         btn.disabled = false;
         btn.classList.remove('loading');
       }
     });
 
-    page.docTitle = 'Password required · QuickPaste';
+    page.docTitle = `${heading} · QuickPaste`;
     page.onMount = () => input.focus({ preventScroll: true });
     return page;
+  }
+
+  function viewLocked(raw, locked) {
+    return viewPasswordPrompt({
+      heading: 'Password required',
+      text: locked.kind === 'old'
+        ? 'This paste is protected. Enter the password to view it.'
+        : 'This paste is encrypted with a password. Enter it to decrypt it in your browser.',
+      async onSubmit(pw) {
+        if (locked.ownerRow) {
+          const paste = await decodeRow(locked.ownerRow, locked.link, pw);
+          cache.set(raw, paste);
+          return viewPaste(paste);
+        }
+        const result = await openLink(raw, pw, locked);
+        if (result.status === 'missing') return notFoundState();
+        if (result.status === 'locked') throw new Error(result.wrong ? 'Incorrect password' : 'Enter the password');
+        cache.set(raw, result.paste);
+        return viewPaste(result.paste);
+      },
+    });
   }
 
   function emptyState(glyph, heading, text, withButton) {
@@ -1286,6 +2443,7 @@
   function renderAccount() {
     const host = $('#account');
     $('[data-nav=mine]').hidden = !currentUser;
+    $('[data-nav=admin]').hidden = !account?.is_admin;
     if (!currentUser) {
       host.innerHTML = '<a class="btn small primary" href="#/login">Sign In</a>';
       return;
@@ -1301,6 +2459,7 @@
         </div>
         <a role="menuitem" href="#/mine">${icon('tray')}<span>My Pastes</span></a>
         <a role="menuitem" href="#/">${icon('plus')}<span>New Paste</span></a>
+        ${account?.is_admin ? `<a role="menuitem" href="#/admin">${icon('gauge')}<span>Admin</span></a>` : ''}
         <button role="menuitem" type="button" data-act="signout">${icon('logout')}<span>Sign Out</span></button>
       </div>`;
 
@@ -1326,11 +2485,13 @@
       if (!item) return;
       setOpen(false);
       if (item.dataset.act === 'signout') {
+        storage.del(vaultSlot(currentUser.id));
+        vaultKey = null;
         try {
           await api.auth.signOut();
         } catch { /* sign out locally regardless */ }
-        if (['mine', 'edit'].includes(parseRoute().name)) location.hash = '#/';
-        setUser(null);
+        if (['mine', 'edit', 'admin'].includes(parseRoute().name)) location.hash = '#/';
+        await setUser(null);
         toast('Signed out');
       }
     });
@@ -1342,13 +2503,15 @@
   let navToken = 0;
 
   function parseRoute() {
-    const [first, second] = location.hash.replace(/^#\/?/, '').split(/[/?]/);
+    const [first, second] = location.hash.replace(/^#\/?/, '').split(/[/?]/)
+      .map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
     if (!first || first === 'new') return { name: 'new' };
     if (first === 'recent') return { name: 'recent' };
     if (first === 'login') return { name: 'login' };
     if (first === 'mine') return { name: 'mine' };
-    if (first === 'edit' && second) return { name: 'edit', id: decodeURIComponent(second) };
-    return { name: 'paste', id: decodeURIComponent(first) };
+    if (first === 'admin') return { name: 'admin', tab: ADMIN_TABS.some(([k]) => k === second) ? second : 'reports' };
+    if (first === 'edit' && second) return { name: 'edit', id: second };
+    return { name: 'paste', id: first };
   }
 
   async function navigate() {
@@ -1360,12 +2523,16 @@
       if (libMissing) {
         page = emptyState('warn', 'Couldn’t load QuickPaste', 'A required script failed to load. Check your connection and refresh the page.', false);
       } else if (route.name === 'paste') {
-        let p = cache.get(route.id);
-        if (!p) {
-          p = await api.get(route.id);
-          if (p && !p.locked) cache.set(route.id, p);
+        const cached = cache.get(route.id);
+        if (cached) {
+          page = viewPaste(cached);
+        } else {
+          const result = await openLink(route.id);
+          if (result.status === 'ok') cache.set(route.id, result.paste);
+          page = result.status === 'ok' ? viewPaste(result.paste)
+            : result.status === 'locked' ? viewLocked(route.id, result)
+              : notFoundState();
         }
-        page = !p ? notFoundState() : p.locked ? viewLocked(route.id) : viewPaste(p);
       } else if (route.name === 'recent') {
         page = viewRecent((await api.recent()) || []);
       } else if (route.name === 'login') {
@@ -1376,18 +2543,32 @@
         }
         page = viewAuth();
       } else if (route.name === 'mine') {
-        page = currentUser
-          ? viewMine((await api.mine()) || [])
-          : viewAuth({ returnTo: '#/mine', note: 'Sign in to see and manage your pastes.' });
+        if (!currentUser) page = viewAuth({ returnTo: '#/mine', note: 'Sign in to see and manage your pastes.' });
+        else if (hasCrypto && !vaultKey) page = viewUnlockVault();
+        else page = viewMine(await loadMine());
       } else if (route.name === 'edit') {
         if (!currentUser) {
           page = viewAuth({ returnTo: location.hash, note: 'Sign in to edit your paste.' });
         } else {
-          const p = await api.getOwn(route.id);
-          page = p ? viewComposer(p)
-            : emptyState('lock', 'Can’t edit this paste', 'It doesn’t exist, or it wasn’t created with your account.', true);
+          try {
+            const paste = await loadOwn(route.id);
+            page = paste ? viewComposer(paste)
+              : emptyState('lock', 'Can’t edit this paste', 'It doesn’t exist, or it wasn’t created with your account.', true);
+          } catch (err) {
+            if (!err.needPassword) throw err;
+            page = viewPasswordPrompt({
+              heading: 'Enter the paste’s password',
+              text: 'This paste is encrypted with a password. Enter it to edit the paste.',
+              onSubmit: async (pw) => viewComposer(await decodeRow(err.row, err.link, pw)),
+            });
+          }
         }
+      } else if (route.name === 'admin') {
+        if (!currentUser) page = viewAuth({ returnTo: location.hash, note: 'Sign in with an admin account.' });
+        else if (!account?.is_admin) page = emptyState('lock', 'Admins only', 'Your account doesn’t have access to the admin dashboard.', true);
+        else page = viewAdmin(route.tab, await api.admin.overview());
       } else {
+        if (currentUser) await refreshAccount();
         page = viewComposer();
       }
     } catch (err) {
@@ -1424,9 +2605,14 @@
     if (!isConfigured) {
       $('.nav-left').insertAdjacentHTML('beforeend', '<span class="demo-badge" title="Fill in config.js to connect Supabase. Pastes and accounts are only saved in this browser.">Demo</span>');
     }
+    if (!hasCrypto) toast('Encryption needs HTTPS — open QuickPaste over https://', 'error');
     if (!libMissing) {
-      const { user, notice } = await api.auth.init(setUser);
+      const { user, notice } = await api.auth.init((u) => setUser(u));
       currentUser = user;
+      if (user) {
+        await restoreVault(user.id);
+        await refreshAccount();
+      }
       if (notice) toast(notice.text, notice.type);
     }
     renderAccount();
