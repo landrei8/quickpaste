@@ -3,12 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <!-- Security policy: run only this site's own scripts, and send data only to this site and your
+       Supabase project. If you change supabaseUrl in config.js, update connect-src to match. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://jkbrbvdcsxlpbwdqfwuq.supabase.co; base-uri 'none'; form-action 'none'; manifest-src 'self'">
+  <meta name="referrer" content="no-referrer">
   <title>QuickPaste</title>
   <meta name="description" content="Paste code or text and share it with a beautiful link.">
   <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="assets/styles.css?v=3">
+  <link rel="stylesheet" href="assets/styles.css?v=4">
 </head>
 <body>
   <header class="nav">
@@ -40,9 +44,10 @@
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js" defer></script>
-  <script src="config.js?v=3"></script>
-  <script src="assets/app.js?v=3" defer></script>
+  <!-- Self-hosted, verified copies (see assets/vendor/VENDOR.md); the browser refuses them if a byte changes. -->
+  <script src="assets/vendor/highlight-11.9.0.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" defer></script>
+  <script src="assets/vendor/supabase-js-2.45.4.js" integrity="sha384-0w2KAL2YHP6wKOkUDzkCDGgVvfmHnj02DHeQ6XcHOgTfFsGyonKOpShMH1x6nk9o" defer></script>
+  <script src="config.js?v=4"></script>
+  <script src="assets/app.js?v=4" defer></script>
 </body>
 </html>

@@ -6,6 +6,9 @@
 //
 // While these still contain "YOUR_", the site runs in Demo mode and saves
 // pastes only in the current browser.
+//
+// If you change supabaseUrl, also update connect-src in the Content-Security-Policy
+// <meta> tag in index.html — the browser blocks requests to any other server.
 window.QUICKPASTE_CONFIG = {
   supabaseUrl: 'https://jkbrbvdcsxlpbwdqfwuq.supabase.co',
   supabaseKey: 'sb_publishable_abUKrBZga88N5I52F8IxZw_O1wbtbWK',

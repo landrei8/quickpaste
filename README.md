@@ -43,12 +43,22 @@ With a paste password, a second PBKDF2 (600,000 rounds) over the password produc
 - The custom-link limit is enforced by the app and the database. Because the server never sees links, a technical user calling the API directly could store extra lookup ids without marking them as custom.
 - When you sign in, Supabase's login service briefly receives your account password. That's how all logins work. Supabase stores only a hash of it.
 
+## Code integrity: nothing loads from outside servers
+
+The encryption only helps if the code doing it can be trusted, so the site runs code from this repository only:
+
+- **Self-hosted libraries.** highlight.js and supabase-js live in [`assets/vendor/`](assets/vendor/VENDOR.md). Each was verified byte-for-byte against an independent official source: the highlight.js GitHub release and the npm registry tarball.
+- **Integrity hashes.** `index.html` pins both files with SHA-384 Subresource Integrity, so the browser refuses to run them if even one byte changes.
+- **Content Security Policy.** A `<meta>` tag lets the page run only this site's own scripts, and send data only to this site and your Supabase project. Even injected code couldn't load other scripts or send pastes anywhere else. If you change `supabaseUrl` in `config.js`, update `connect-src` in that tag too.
+
+What's left to protect is your GitHub account (use 2-step verification or a passkey, and add no collaborators you don't fully trust), your own computer, and the visitor's device. Also make sure **Settings → Pages → Enforce HTTPS** is ticked.
+
 ## 1. Set up Supabase
 
 1. Create a project at [supabase.com](https://supabase.com).
 2. Open **SQL Editor → New query**, paste in all of [`supabase/schema.sql`](supabase/schema.sql), and click **Run**. You can re-run it safely whenever the file changes, and existing pastes are kept.
 3. Go to **Project Settings → API** and copy the **Project URL** and the **anon** (or **publishable**) key.
-4. Put both values into [`config.js`](config.js).
+4. Put both values into [`config.js`](config.js), and put the same Project URL into `connect-src` in the Content-Security-Policy tag at the top of [`index.html`](index.html).
 
 The anon key is safe to make public. Every table has Row Level Security on and no policies, so the key can only call the functions in `schema.sql`. Those functions check ownership and admin rights themselves. Never put the `service_role` or secret key in this project.
 
@@ -96,6 +106,7 @@ config.js             Supabase URL + public key
 assets/styles.css     Design system and animations
 assets/app.js         Router, views, encryption, accounts, admin, Supabase API
 assets/icon.svg       App icon
+assets/vendor/        Self-hosted, verified highlight.js and supabase-js (see VENDOR.md)
 supabase/schema.sql   Tables, security and RPC functions
 ```
 
