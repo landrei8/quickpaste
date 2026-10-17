@@ -19,7 +19,9 @@ The link is everything after `#/` (a random 12 characters, or a custom word like
 - a **lookup id**, which is stored as the row id in Supabase
 - an **AES-256-GCM key**, which never leaves the browser
 
-The title, text and language are encrypted with that key. So the database only ever contains scrambled bytes plus the lookup id, and neither of those reveals the link or the content. Because everything after `#` is never sent to any server, GitHub and Supabase never see the link either.
+The title, text and language are encrypted with that key. So the database only ever contains scrambled bytes plus the lookup id, and neither of those reveals the link or the content. Browsers never send the part after `#` to GitHub, and the app sends Supabase only the lookup id, so the link stays secret.
+
+The one exception is **Public** pastes. To list them in Recent, the server stores their link and their content unencrypted, because everyone can read them anyway. That's why a paste with a password is never public: choosing Public with a password saves it as Unlisted, so its link stays secret.
 
 With a paste password, a second PBKDF2 (600,000 rounds) over the password produces a second key half and a login token. The server stores only a bcrypt hash of that token, so it can refuse wrong passwords. It never sees the password itself.
 
@@ -29,8 +31,8 @@ With a paste password, a second PBKDF2 (600,000 rounds) over the password produc
 |---|---|---|
 | Unlisted | encrypted | only people with the link |
 | Private | encrypted | only you, and only while signed in |
-| Any paste with a password | encrypted | only people with the link **and** the password |
-| Public, no password | readable | everyone, because it's listed in Recent |
+| Any paste with a password (always unlisted or private) | encrypted | only people with the link **and** the password |
+| Public, no password | readable, with its link | everyone, because it's listed in Recent |
 | Created before encryption | readable | as before. Duplicate it to get an encrypted copy. |
 | File (yours, sharing off) | encrypted | only you, while signed in |
 | File (sharing on, or a guest upload) | encrypted | only people with the link |
@@ -39,7 +41,22 @@ With a paste password, a second PBKDF2 (600,000 rounds) over the password produc
 
 **My Pastes.** Your links are stored encrypted with a random "vault" key. That vault key is itself encrypted with your account password (600,000 rounds of PBKDF2) inside your browser. On a new device you type your password once to unlock the list.
 
-**Reports.** A report sends the paste's link to the admins (and its password, if the reporter chooses to include it), so admins can decrypt that one paste. They can't read any other encrypted paste.
+**Reports.** A report carries the paste's link (and its password, only if the reporter ticks the box), so admins can decrypt that one paste. They can't read any other encrypted paste. The reporter's browser encrypts the link and password for the admins' public keys (ECDH P-256 + AES-256-GCM), so the database holds only ciphertext. Each admin's private key is created in their browser and stored encrypted with their account password, the same way as My Pastes. When a report is resolved or dismissed, or its paste is deleted, the encrypted link is deleted too.
+
+- An admin's key is created the first time they sign in, or unlock, as an admin. Reports sent before any admin had a key arrive without a link.
+- A new admin can read older open reports after any existing admin opens the dashboard, which re-encrypts them for every admin key. The same step re-encrypts, then deletes, plain-text links left by reports from older versions.
+
+**Rate limits.** The database refuses bursts from one visitor. A visitor is identified by a salted hash of their IP address; the address itself is never stored.
+
+| Action | Limit |
+|---|---|
+| Wrong paste passwords | 10 per 10 minutes per visitor, and 30 per hour per paste from everyone combined |
+| New pastes | 30 per 10 minutes |
+| Reports | 5 per 10 minutes |
+| File uploads | 20 per hour for guests, 100 per hour for signed-in users |
+| Links that don't exist, and custom-link checks | 120 per 10 minutes each |
+
+**Admin → Settings** shows whether IP-based limits are active. If Supabase ever stopped passing the visitor's IP address, only the per-paste password limit would remain.
 
 **Limits worth knowing**
 
@@ -107,7 +124,11 @@ Refresh the site, and an **Admin** link appears in the top bar (on phones it's i
   - Deletion happens as people visit the site. On a site with no visitors, bytes can linger until the next visit or until an admin presses **Clean up**.
 - **Supabase free plan:** 1 GB of storage in total and 50 MB per file. Keep user limits × number of users, plus the guest pool, within that.
 - **Deleting a user** from the admin dashboard removes their files from Storage too.
-- **Limit accuracy:** limits are measured from Storage itself. One upload can go past a limit by at most one file, because the check runs before the file lands.
+- **Limit accuracy:** limits are exact, even with many uploads at once.
+  1. Before uploading, the browser reserves the file's exact size.
+  2. The database checks the reservation against the limit under a lock, so two uploads can't both take the last free space.
+  3. Storage accepts only bytes for a matching reservation, no larger than reserved.
+  4. Reservations that never get their bytes are released after an hour.
 
 To remove an admin: `delete from public.admins where user_id = (select id from auth.users where email = 'them@example.com');`
 
@@ -136,5 +157,6 @@ supabase/schema.sql   Tables, security and RPC functions
 - Maximum paste size is 500 KB.
 - Pastes created while signed out have no owner, so nobody can edit them later.
 - As the owner, you can open your own pastes without burning them, even after they expire. Nobody else can see an expired or private paste.
-- There is no rate limiting. If spam becomes a problem, add Cloudflare Turnstile or put an Edge Function in front of `create_paste`.
+- Rate limits are listed above. If bots still get through, for example from many IP addresses, add Cloudflare Turnstile in front of creating pastes and uploading.
+
 - There's no "forgot password" flow yet.
