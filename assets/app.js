@@ -33,10 +33,12 @@
   const USER_FILE_MAX = 25 * MB;
   const GUEST_FILE_MAX = 5 * MB;
   const GCM_OVERHEAD = 28; // 12-byte IV + 16-byte tag added to every encrypted file
-  const FILE_EXPIRATIONS = {
-    user: [['', 'Never'], ['3600', '1 Hour'], ['86400', '1 Day'], ['604800', '1 Week'], ['2592000', '1 Month']],
-    guest: [['3600', '1 Hour'], ['86400', '1 Day'], ['604800', '1 Week']],
-  };
+  const FILE_EXPIRATIONS = [['', 'Never'], ['3600', '1 Hour'], ['86400', '1 Day'], ['604800', '1 Week'], ['2592000', '1 Month']];
+  // Guests can't choose: admins pick one of these lifetimes for every guest file.
+  const GUEST_TTLS = [[30, '30 minutes'], [60, '1 hour'], [1440, '1 day']];
+  const guestTtlLabel = (minutes) => (GUEST_TTLS.find(([m]) => m === minutes) || GUEST_TTLS[1])[1];
+  const CLEANUP_KEY = 'quickpaste:last-cleanup';
+  const CLEANUP_EVERY = 10 * 60 * 1000; // each browser helps clean up at most every 10 minutes
 
   const LANGUAGES = [
     ['auto', 'Auto-detect'], ['plaintext', 'Plain Text'], ['bash', 'Bash'], ['c', 'C'],
@@ -427,6 +429,7 @@
       report: (r) => rpc('report_paste', {
         p_id: r.id, p_link: r.link, p_password: r.password || null, p_reason: r.reason, p_details: r.details || null,
       }),
+      siteSettings: () => rpc('site_settings'),
       myAccount: () => rpc('my_account'),
       getVault: () => rpc('get_vault'),
       createVault: (wrapped, salt) => rpc('create_vault', { p_wrapped_key: wrapped, p_salt: salt }),
@@ -457,6 +460,8 @@
           p_id: id, p_enc_meta: encMeta, p_owner_note: note, p_expires_in: expiresIn,
         }),
         get: (id) => rpc('get_file', { p_id: id }),
+        expiredGuest: () => rpc('expired_guest_files', { p_limit: 50 }),
+        purgeGuestRows: () => rpc('purge_expired_guest_rows'),
         mine: () => rpc('my_files'),
         setShared: (id, shared) => rpc('set_file_shared', { p_id: id, p_shared: shared }),
         remove: (id) => rpc('delete_file', { p_id: id }),
@@ -470,6 +475,7 @@
         userFilePaths: (id) => rpc('admin_user_file_paths', { p_user_id: id }),
         setUserStorage: (id, mb) => rpc('admin_set_user_storage', { p_user_id: id, p_quota_mb: mb }),
         setStorageSetting: (key, mb) => rpc('admin_set_storage_setting', { p_key: key, p_mb: mb }),
+        setGuestTtl: (minutes) => rpc('admin_set_guest_ttl', { p_minutes: minutes }),
         reports: (status) => rpc('admin_reports', { p_status: status }),
         setReportStatus: (id, status) => rpc('admin_set_report_status', { p_id: id, p_status: status }),
         pastes: (query) => rpc('admin_pastes', { p_query: query || null, p_limit: 200, p_offset: 0 }),
@@ -571,7 +577,7 @@
     const uid = () => user?.id ?? null;
     const isAdmin = () => !!user && read(K.admins, []).includes(user.id);
     const requireAdmin = () => { if (!isAdmin()) throw new Error('Admins only'); };
-    const SETTINGS = { custom_link_limit: 5, storage_quota_mb: 25, admin_storage_quota_mb: 50, guest_pool_mb: 200 };
+    const SETTINGS = { custom_link_limit: 5, storage_quota_mb: 25, admin_storage_quota_mb: 50, guest_pool_mb: 200, guest_file_ttl_minutes: 60 };
     const settings = () => ({ ...SETTINGS, ...read(K.settings, {}) });
     const defaultLimit = () => settings().custom_link_limit;
     const linkLimit = (id) => read(K.limits, {})[id]?.links ?? defaultLimit();
@@ -591,6 +597,13 @@
     const fileJson = (f) => {
       const { owner_id, owner_note, ...rest } = f;
       return { ...rest, is_owner: !!user && owner_id === user.id, guest: !owner_id, expired: isExpired(f) };
+    };
+    // Mirrors qp_guest_object_removable(): expired, or abandoned for over an hour.
+    const guestRemovable = (path) => {
+      const f = Object.values(read(K.files, {})).find((x) => x.bucket === 'guest-files' && x.object_path === path);
+      if (f) return isExpired(f);
+      const o = objects()[`guest-files/${path}`];
+      return !!o && new Date(o.created_at).getTime() < Date.now() - 3600000;
     };
     const removeObject = async (key) => {
       const all = objects();
@@ -674,6 +687,9 @@
           created_at: new Date().toISOString(), resolved_at: null,
         });
         write(K.reports, reports);
+      },
+      async siteSettings() {
+        return { guest_file_ttl_minutes: settings().guest_file_ttl_minutes };
       },
       async myAccount() {
         if (!user) return null;
@@ -773,13 +789,26 @@
         async removeObjects(bucket, paths) {
           for (const path of paths) {
             const mine = bucket === 'files' && uid() && path.startsWith(`${uid()}/`);
-            if (!mine && !isAdmin()) throw new Error('Not allowed');
+            if (!mine && !isAdmin() && !(bucket === 'guest-files' && guestRemovable(path))) throw new Error('Not allowed');
             await removeObject(`${bucket}/${path}`);
           }
         },
+        async expiredGuest() {
+          return Object.keys(objects()).filter((k) => k.startsWith('guest-files/'))
+            .map((k) => k.slice('guest-files/'.length)).filter(guestRemovable).slice(0, 50);
+        },
+        async purgeGuestRows() {
+          const all = read(K.files, {});
+          let n = 0;
+          for (const [id, f] of Object.entries(all)) {
+            if (f.bucket === 'guest-files' && isExpired(f) && !objects()[`guest-files/${f.object_path}`]) { delete all[id]; n++; }
+          }
+          write(K.files, all);
+          return n;
+        },
         async register(id, encMeta, note, expiresIn) {
           if (!LOOKUP_RE.test(id)) throw new Error('Invalid file id');
-          if (!uid() && ![3600, 86400, 604800].includes(expiresIn)) throw new Error('Guest uploads must expire within a week');
+          if (!uid()) expiresIn = settings().guest_file_ttl_minutes * 60; // guests don't choose
           const bucket = uid() ? 'files' : 'guest-files';
           const path = uid() ? `${uid()}/${id}` : `guest/${id}`;
           const object = objects()[`${bucket}/${path}`];
@@ -840,7 +869,7 @@
             users: Object.keys(read(K.users, {})).length,
             open_reports: read(K.reports, []).filter((r) => r.status === 'open').length,
             files: files.length, storage_bytes: files.reduce((sum, f) => sum + f.size, 0),
-            guest_pool_used: guestPoolUsed(), default_limit: s.custom_link_limit,
+            guest_pool_used: guestPoolUsed(), default_limit: s.custom_link_limit, guest_file_ttl_minutes: s.guest_file_ttl_minutes,
             storage_quota_mb: s.storage_quota_mb, admin_storage_quota_mb: s.admin_storage_quota_mb, guest_pool_mb: s.guest_pool_mb,
           };
         },
@@ -878,6 +907,11 @@
         async setUserStorage(id, mb) {
           requireAdmin();
           setLimit(id, 'storage', mb);
+        },
+        async setGuestTtl(minutes) {
+          requireAdmin();
+          if (![30, 60, 1440].includes(minutes)) throw new Error('Choose 30 minutes, 1 hour or 1 day');
+          write(K.settings, { ...read(K.settings, {}), guest_file_ttl_minutes: minutes });
         },
         async setStorageSetting(key, mb) {
           requireAdmin();
@@ -1037,6 +1071,7 @@
   // ───────── State ─────────
 
   let currentUser = null;
+  let site = { guest_file_ttl_minutes: 60 }; // public settings, loaded at startup
   let account = null;   // { is_admin, custom_used, custom_limit, has_vault }
   let vaultKey = null;  // AES key that encrypts this user's list of links (owner_note)
   let booted = false;
@@ -1381,6 +1416,19 @@
       toast(err.message || 'Couldn’t delete the file', 'error');
       return false;
     }
+  }
+
+  // Every visitor's browser quietly helps delete expired guest files (at most every
+  // 10 minutes). The Storage rules only allow removing files that have already
+  // expired or were abandoned mid-upload, so nothing live can be touched.
+  async function autoCleanup() {
+    try {
+      if (Date.now() - Number(storage.get(CLEANUP_KEY) || 0) < CLEANUP_EVERY) return;
+      storage.set(CLEANUP_KEY, String(Date.now()));
+      const paths = (await api.files.expiredGuest()) || [];
+      if (paths.length) await api.files.removeObjects('guest-files', paths);
+      await api.files.purgeGuestRows();
+    } catch { /* best effort — the next visitor tries again */ }
   }
 
   const fileExt = (name = '') => (name.includes('.') ? name.split('.').pop().slice(0, 4).toUpperCase() : 'FILE');
@@ -2193,8 +2241,8 @@
   // data: { used, quota, files } for signed-in users, null for guests.
   function viewFiles(data) {
     const guest = !currentUser;
-    const expOptions = FILE_EXPIRATIONS[guest ? 'guest' : 'user']
-      .map(([v, l]) => `<option value="${v}" ${guest && v === '86400' ? 'selected' : ''}>${l}</option>`).join('');
+    const expOptions = FILE_EXPIRATIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+    const guestTtl = guestTtlLabel(site.guest_file_ttl_minutes);
     const page = html(`
       <div class="page page-files">
         <header class="page-head">
@@ -2214,11 +2262,13 @@
           <strong>Drop files here or click to choose</strong>
           <small>Up to ${formatBytes(fileMax())} each · encrypted in your browser before upload</small>
         </label>
-        <div class="upload-options reveal" style="--d:2">
-          <span>${guest ? 'Delete after' : 'Expires'}</span>
-          <label class="select small"><select name="expires" aria-label="Expiration">${expOptions}</select></label>
-        </div>
-        ${guest ? `<p class="create-note"><span>Guest uploads are limited to ${formatBytes(GUEST_FILE_MAX)} and always expire. <a href="#/login">Sign in</a> for private storage you control.</span></p>` : ''}
+        ${guest ? `
+          <p class="upload-options guest-ttl reveal" style="--d:2">${icon('timer')}<span>Deleted automatically after <strong>${guestTtl}</strong></span></p>
+          <p class="create-note"><span>Guest uploads are limited to ${formatBytes(GUEST_FILE_MAX)}. <a href="#/login">Sign in</a> for private storage you control.</span></p>` : `
+          <div class="upload-options reveal" style="--d:2">
+            <span>Expires</span>
+            <label class="select small"><select name="expires" aria-label="Expiration">${expOptions}</select></label>
+          </div>`}
         <ul class="upload-queue"></ul>
         ${data ? '<h2 class="section-label reveal" style="--d:3">Your files</h2><ul class="mine-list card file-list reveal" style="--d:3"></ul>' : ''}
       </div>`).firstElementChild;
@@ -2316,7 +2366,7 @@
         const status = $('.status', item);
         try {
           status.textContent = `Encrypting and uploading ${formatBytes(file.size)}…`;
-          const expiresIn = expires.value ? Number(expires.value) : null;
+          const expiresIn = expires?.value ? Number(expires.value) : null; // guests: set by the server
           const f = await uploadFile(file, expiresIn);
           item.classList.add('done');
           $('.spinner', item).remove();
@@ -2921,6 +2971,16 @@
               <button class="btn small primary" type="button" data-save="${key}">Save</button>
             </div>
           </div>`).join('')}
+        <div class="row">
+          <div class="row-label">
+            <span class="row-icon" style="background:#ff3b30">${icon('timer')}</span>
+            <span class="row-text">Guest file lifetime<small>Guest files are deleted automatically after this time</small></span>
+          </div>
+          <div class="segmented guest-ttl-picker" role="radiogroup" aria-label="Guest file lifetime"
+            style="--n:${GUEST_TTLS.length};--i:${Math.max(0, GUEST_TTLS.findIndex(([m]) => m === ctx.stats.guest_file_ttl_minutes))}">
+            ${GUEST_TTLS.map(([m, l]) => `<button type="button" role="radio" aria-checked="${m === ctx.stats.guest_file_ttl_minutes}" data-ttl="${m}">${l.replace(' minutes', ' min')}</button>`).join('')}
+          </div>
+        </div>
       </div>
       <h2 class="section-label">Admins</h2>
       <div class="group card info-card">
@@ -2929,6 +2989,18 @@
 select id from auth.users where email = 'them@example.com';</code></pre>
         <p>Admins can’t read encrypted pastes unless someone reports one with its link.</p>
       </div>`;
+    const ttlPicker = $('.guest-ttl-picker', panel);
+    ttlPicker.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-ttl]');
+      if (!b || b.getAttribute('aria-checked') === 'true') return;
+      const minutes = Number(b.dataset.ttl);
+      if (!(await adminAction(() => api.admin.setGuestTtl(minutes), `Guest files are now deleted after ${guestTtlLabel(minutes)}`))) return;
+      site.guest_file_ttl_minutes = minutes;
+      [...ttlPicker.children].forEach((n, i) => {
+        n.setAttribute('aria-checked', String(n === b));
+        if (n === b) ttlPicker.style.setProperty('--i', i);
+      });
+    });
     $('.storage-settings', panel).addEventListener('click', async (e) => {
       const key = e.target.closest('[data-save]')?.dataset.save;
       if (!key) return;
@@ -3322,6 +3394,7 @@ select id from auth.users where email = 'them@example.com';</code></pre>
     }
     if (!hasCrypto) toast('Encryption needs HTTPS — open QuickPaste over https://', 'error');
     if (!libMissing) {
+      site = { ...site, ...((await api.siteSettings().catch(() => null)) || {}) };
       const { user, notice } = await api.auth.init((u) => setUser(u));
       currentUser = user;
       if (user) {
@@ -3334,6 +3407,7 @@ select id from auth.users where email = 'them@example.com';</code></pre>
     booted = true;
     window.addEventListener('hashchange', navigate);
     navigate();
+    if (!libMissing && hasCrypto) setTimeout(autoCleanup, 4000);
   }
   boot();
 })();
